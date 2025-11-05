@@ -1,13 +1,8 @@
-from .detector3d_template import Detector3DTemplate
-from pcdet.ops.roiaware_pool3d import roiaware_pool3d_utils
-from pcdet.models.backbones_3d.focal_sparse_conv.focal_sparse_utils import FocalLoss
 import torch
 import torch.nn as nn
-from ...utils import loss_utils
-import time
-from pathlib import Path
-import os
-import numpy as np
+import torch.nn.functional as F
+from .detector3d_template import Detector3DTemplate
+
 
 class PillarNet(Detector3DTemplate):
     def __init__(self, model_cfg, num_class, dataset):
@@ -23,7 +18,6 @@ class PillarNet(Detector3DTemplate):
                         param.requires_grad = False
         else:
             self.no_grad_module = []
-
 
     def forward(self, batch_dict):
         for cur_module in self.module_list:
@@ -48,7 +42,6 @@ class PillarNet(Detector3DTemplate):
             pred_dicts, recall_dicts = self.post_processing(batch_dict)
             return pred_dicts, recall_dicts
 
-    
     def get_training_loss(self):
         disp_dict = {}
 
@@ -68,7 +61,24 @@ class PillarNet(Detector3DTemplate):
         loss_feature, tb_dict = self.radar_backbone_2d.get_loss(batch_dict)
         loss_rpn, _tb_dict = self.radar_dense_head.get_loss()
         tb_dict.update(_tb_dict)
-        loss = loss_feature + loss_rpn
+        
+        # TiGDistill-BEV Inter-channel and Inter-keypoint
+        if 'loss_bev_combined' in batch_dict:
+            loss_bev_ic = batch_dict['loss_bev_ic']
+            loss_bev_ik = batch_dict['loss_bev_ik']
+            loss_bev_combined = batch_dict['loss_bev_combined']
+            loss_weights = self.model_cfg.RADAR_DENSE_HEAD.LOSS_CONFIG.LOSS_WEIGHTS
+            bev_ic_weight = loss_weights.get('bev_ic_weight', 1.0)
+            bev_ik_weight = loss_weights.get('bev_ik_weight', 1.0)
+            
+            # Use combined loss or weighted individual losses
+            loss = loss_feature + loss_rpn + loss_bev_ic * bev_ic_weight + loss_bev_ik * bev_ik_weight
+            
+            tb_dict['loss_bev_ic'] = loss_bev_ic.item()
+            tb_dict['loss_bev_ik'] = loss_bev_ik.item()
+            tb_dict['loss_bev_combined'] = loss_bev_combined.item()
+        else:
+            loss = loss_feature + loss_rpn
         
         return loss, tb_dict, disp_dict
 
