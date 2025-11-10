@@ -62,7 +62,7 @@ class PillarNet(Detector3DTemplate):
         loss_rpn, _tb_dict = self.radar_dense_head.get_loss()
         tb_dict.update(_tb_dict)
         
-        # TiGDistill-BEV Inter-channel and Inter-keypoint
+        # TiGDistill-BEV Inter-channel, Inter-keypoint, and Contrastive
         if 'loss_bev_combined' in batch_dict:
             loss_bev_ic = batch_dict['loss_bev_ic']
             loss_bev_ik = batch_dict['loss_bev_ik']
@@ -71,8 +71,17 @@ class PillarNet(Detector3DTemplate):
             bev_ic_weight = loss_weights.get('bev_ic_weight', 1.0)
             bev_ik_weight = loss_weights.get('bev_ik_weight', 1.0)
             
-            # Use combined loss or weighted individual losses
-            loss = loss_feature + loss_rpn + loss_bev_ic * bev_ic_weight + loss_bev_ik * bev_ik_weight
+            # Check if contrastive loss is available
+            if 'loss_bev_contrastive' in batch_dict:
+                loss_bev_contrastive = batch_dict['loss_bev_contrastive']
+                bev_contrastive_weight = loss_weights.get('bev_contrastive_weight', 1.0)
+                loss = loss_feature + loss_rpn + \
+                       loss_bev_ic * bev_ic_weight + \
+                       loss_bev_ik * bev_ik_weight + \
+                       loss_bev_contrastive * bev_contrastive_weight
+                tb_dict['loss_bev_contrastive'] = loss_bev_contrastive.item()
+            else:
+                loss = loss_feature + loss_rpn + loss_bev_ic * bev_ic_weight + loss_bev_ik * bev_ik_weight
             
             tb_dict['loss_bev_ic'] = loss_bev_ic.item()
             tb_dict['loss_bev_ik'] = loss_bev_ik.item()
