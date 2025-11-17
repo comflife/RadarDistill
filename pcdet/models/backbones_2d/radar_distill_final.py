@@ -542,8 +542,8 @@ class Radar_Distill(BaseBEVBackboneV2):
             loss_bev_ik = 0.0  # inter-keypoint loss (inner region only)
             loss_bev_contrastive = 0.0  # contrastive loss (boundary learning)
             # Detailed boundary loss components
-            loss_inner_align = 0.0
-            loss_outer_align = 0.0
+            # loss_inner_align = 0.0
+            # loss_outer_align = 0.0
             loss_boundary_consist = 0.0
             loss_cross_boundary = 0.0
             num_objects = 0
@@ -560,15 +560,17 @@ class Radar_Distill(BaseBEVBackboneV2):
                         # ============= Inner Region: Alignment Loss =============
                         f_teacher_inner = teacher_inner[obj_idx]  # (num_keypoints_inner, C)
                         f_student_inner = student_inner[obj_idx]  # (num_keypoints_inner, C)
+                        f_teacher_inner_norm = F.normalize(f_teacher_inner, p=2, dim=1)
+                        f_student_inner_norm = F.normalize(f_student_inner, p=2, dim=1)
 
                         # Compute inter-channel correlation matrices
-                        A_teacher = f_teacher_inner.T @ f_teacher_inner  # (C, C)
-                        A_student = f_student_inner.T @ f_student_inner  # (C, C)
+                        A_teacher = f_teacher_inner_norm.T @ f_teacher_inner_norm  # (C, C)
+                        A_student = f_student_inner_norm.T @ f_student_inner_norm  # (C, C)
                         loss_bev_ic += F.mse_loss(A_teacher, A_student, reduction='mean')
                         
                         # Compute inter-keypoint correlation matrices
-                        B_teacher = f_teacher_inner @ f_teacher_inner.T  # (num_keypoints_inner, num_keypoints_inner)
-                        B_student = f_student_inner @ f_student_inner.T  # (num_keypoints_inner, num_keypoints_inner)
+                        B_teacher = f_teacher_inner_norm @ f_teacher_inner_norm.T  # (num_keypoints_inner, num_keypoints_inner)
+                        B_student = f_student_inner_norm @ f_student_inner_norm.T  # (num_keypoints_inner, num_keypoints_inner)
                         loss_bev_ik += F.mse_loss(B_teacher, B_student, reduction='mean')
                         
                         # ============= Outer Region: Teacher-Student Boundary Learning =============
@@ -601,9 +603,9 @@ class Radar_Distill(BaseBEVBackboneV2):
                         # 3. Boundary Consistency: Teacher의 inner-outer 경계 거리를 Student도 학습
                         
                         # Teacher의 inner-outer 평균 거리
-                        teacher_boundary_distance = torch.mm(t_inner_norm, t_outer_norm.T).mean()
+                        teacher_boundary_distance = torch.mm(t_inner_norm, t_outer_norm.T)
                         # Student의 inner-outer 평균 거리
-                        student_boundary_distance = torch.mm(s_inner_norm, s_outer_norm.T).mean()
+                        student_boundary_distance = torch.mm(s_inner_norm, s_outer_norm.T)
                         boundary_consistency = F.mse_loss(student_boundary_distance, teacher_boundary_distance)
                         
                         # 4. Cross-Boundary Contrast: Student inner와 Teacher outer는 멀어야 함

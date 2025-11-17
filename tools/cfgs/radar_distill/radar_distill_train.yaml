@@ -115,7 +115,7 @@ MODEL:
             
             # ===== Region Configuration =====
             INNER_FACTOR: 1.0            # GT box 크기 (inner region = object)
-            OUTER_FACTOR: 2.0            # 확장된 box 크기 (outer region = background)
+            OUTER_FACTOR: 1.5            # 확장된 box 크기 (outer region = background)
             
             # ===== Loss Weights =====
             BEV_IC_WEIGHT: 5           # Inter-channel loss weight (inner region correlation)
