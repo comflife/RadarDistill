@@ -353,6 +353,32 @@ def clip_sigmoid(x, eps=1e-4):
     # y = torch.clamp(x.sigmoid_(), min=eps, max=1 - eps)
     y = torch.clamp(x.sigmoid(), min=eps, max=1 - eps)
     return y
+
+
+def compute_kl_loss(student_logits, teacher_logits, temperature=1.0):
+    """
+    KL Divergence Loss for Knowledge Distillation
+    
+    Args:
+        student_logits: (B, N) or (N, M) raw scores (before softmax)
+        teacher_logits: (B, N) or (N, M) raw scores (before softmax)
+        temperature: Softening factor (보통 2.0 ~ 4.0 사용)
+    
+    Returns:
+        KL divergence loss (scalar)
+    """
+    # 1. Student는 LogSoftmax, Teacher는 Softmax를 취해야 함 (KL 공식 특성상)
+    # dim=-1: 마지막 차원(보통 관계 대상)에 대해 확률 분포를 만듦
+    student_log_prob = F.log_softmax(student_logits / temperature, dim=-1)
+    teacher_prob = F.softmax(teacher_logits / temperature, dim=-1)
+    
+    # 2. KLDivLoss 계산 (reduction='batchmean' 권장)
+    # KL(P || Q) = sum(P * (log P - log Q)) 형태이지만 
+    # PyTorch KLDivLoss는 Input이 Log P, Target이 P를 받음.
+    kl_loss = F.kl_div(student_log_prob, teacher_prob, reduction='batchmean')
+    
+    # 3. Temperature의 제곱만큼 Gradient가 작아지므로 보정
+    return kl_loss * (temperature ** 2)
             
 
 class Radar_Distill(BaseBEVBackboneV2):
@@ -601,12 +627,19 @@ class Radar_Distill(BaseBEVBackboneV2):
                         # outer_alignment = F.mse_loss(s_outer_norm, t_outer_norm, reduction='mean')
                         
                         # 3. Boundary Consistency: Teacher의 inner-outer 경계 거리를 Student도 학습
+                        # KL Divergence를 사용하여 관계 분포를 정렬
                         
-                        # Teacher의 inner-outer 평균 거리
-                        teacher_boundary_distance = torch.mm(t_inner_norm, t_outer_norm.T)
-                        # Student의 inner-outer 평균 거리
-                        student_boundary_distance = torch.mm(s_inner_norm, s_outer_norm.T)
-                        boundary_consistency = F.mse_loss(student_boundary_distance, teacher_boundary_distance)
+                        # Similarity Matrix 계산 (scaling factor 추가)
+                        # (N_in, N_out) Teacher의 관계 맵
+                        scale_factor = t_inner_norm.shape[1] ** -0.5  # sqrt(dim)로 나눔
+                        teacher_rel_logits = torch.mm(t_inner_norm, t_outer_norm.T) * scale_factor
+                        
+                        # (N_in, N_out) Student의 관계 맵
+                        student_rel_logits = torch.mm(s_inner_norm, s_outer_norm.T) * scale_factor
+                        
+                        # KL Divergence로 경계 일관성 손실 계산
+                        # "Inner 포인트 하나가 Outer 포인트들에 대해 가지는 분포"를 맞춤 (dim=-1 기준)
+                        boundary_consistency = compute_kl_loss(student_rel_logits, teacher_rel_logits, temperature=4.0)
                         
                         # 4. Cross-Boundary Contrast: Student inner와 Teacher outer는 멀어야 함
                         cross_boundary_sim = torch.mm(s_inner_norm, t_outer_norm.T)
