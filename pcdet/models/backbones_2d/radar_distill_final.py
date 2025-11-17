@@ -118,6 +118,7 @@ def extract_dual_region_keypoints(
 
     pc_range = torch.tensor(point_cloud_range, device=bev_features.device)
     voxel_size_tensor = torch.tensor(voxel_size, device=bev_features.device)
+    fallback_outer_count = num_keypoints_outer if num_keypoints_outer is not None else max(num_keypoints_inner, 1)
 
     for b in range(batch_size):
         batch_bev_features = bev_features[b]  # (C, H, W)
@@ -129,6 +130,48 @@ def extract_dual_region_keypoints(
 
         if valid_gt_boxes.shape[0] == 0:
             continue
+
+        centers_all = valid_gt_boxes[:, 0:2]
+        inner_dims_all = valid_gt_boxes[:, 3:5] * inner_factor
+        angles_all = valid_gt_boxes[:, 6]
+        cos_all = torch.cos(angles_all)
+        sin_all = torch.sin(angles_all)
+
+        def mask_out_other_inners(points_world, current_idx):
+            if points_world.shape[0] == 0 or valid_gt_boxes.shape[0] <= 1:
+                return torch.ones(points_world.shape[0], dtype=torch.bool, device=points_world.device)
+            keep_mask = torch.ones(points_world.shape[0], dtype=torch.bool, device=points_world.device)
+            for other_idx in range(valid_gt_boxes.shape[0]):
+                if other_idx == current_idx:
+                    continue
+                rel = points_world - centers_all[other_idx]
+                rot = torch.stack([
+                    torch.stack([cos_all[other_idx], sin_all[other_idx]], dim=0),
+                    torch.stack([-sin_all[other_idx], cos_all[other_idx]], dim=0)
+                ], dim=0)
+                local = torch.matmul(rel, rot)
+                inside_x = torch.abs(local[:, 0]) <= (inner_dims_all[other_idx, 0] / 2)
+                inside_y = torch.abs(local[:, 1]) <= (inner_dims_all[other_idx, 1] / 2)
+                keep_mask &= ~(inside_x & inside_y)
+                if not keep_mask.any():
+                    break
+            return keep_mask
+
+        def adjust_sample_count(local_pts, world_pts, target_count):
+            if target_count is None or local_pts.shape[0] == target_count:
+                return local_pts, world_pts
+            if local_pts.shape[0] == 0:
+                return local_pts, world_pts
+            device = local_pts.device
+            target_count = int(target_count)
+            if local_pts.shape[0] > target_count:
+                idx = torch.randperm(local_pts.shape[0], device=device)[:target_count]
+                return local_pts[idx], world_pts[idx]
+            repeat_count = target_count - local_pts.shape[0]
+            repeat_idx = torch.randint(0, local_pts.shape[0], (repeat_count,), device=device)
+            local_pts = torch.cat([local_pts, local_pts[repeat_idx]], dim=0)
+            world_pts = torch.cat([world_pts, world_pts[repeat_idx]], dim=0)
+            return local_pts, world_pts
 
         inner_box_keypoints_list = []
         outer_box_keypoints_list = []
@@ -142,7 +185,34 @@ def extract_dual_region_keypoints(
 
             # Rotation matrix
             rot_sin, rot_cos = torch.sin(box_angle), torch.cos(box_angle)
-            rot_mat = torch.tensor([[rot_cos, -rot_sin], [rot_sin, rot_cos]], device=bev_features.device)
+            rot_mat = torch.stack([
+                torch.stack([rot_cos, -rot_sin], dim=0),
+                torch.stack([rot_sin, rot_cos], dim=0)
+            ], dim=0)
+
+            def rejection_sample_outer_points(required_count):
+                target = max(int(required_count), 1)
+                samples_local = []
+                attempts = 0
+                max_attempts = max(target * 50, 2000)
+                while len(samples_local) < target and attempts < max_attempts:
+                    candidate_local = (torch.rand(1, 2, device=bev_features.device, dtype=bev_features.dtype) - 0.5)
+                    candidate_local = candidate_local * box_dims_outer.unsqueeze(0)
+                    inside_self_x = torch.abs(candidate_local[:, 0]) <= (box_dims_inner[0] / 2)
+                    inside_self_y = torch.abs(candidate_local[:, 1]) <= (box_dims_inner[1] / 2)
+                    if (inside_self_x & inside_self_y).item():
+                        attempts += 1
+                        continue
+                    candidate_world = box_center.unsqueeze(0) + torch.matmul(candidate_local, rot_mat.T)
+                    keep_mask = mask_out_other_inners(candidate_world, i)
+                    if keep_mask.item():
+                        samples_local.append(candidate_local)
+                    attempts += 1
+                if len(samples_local) == 0:
+                    return None, None
+                samples_local = torch.cat(samples_local, dim=0)
+                samples_world = box_center.unsqueeze(0) + torch.matmul(samples_local, rot_mat.T)
+                return samples_local, samples_world
 
             # ============= Inner Region (GT box 내부) =============
             if x_sample_num is not None and y_sample_num is not None:
@@ -173,43 +243,77 @@ def extract_dual_region_keypoints(
             ).squeeze(0).squeeze(1).permute(1, 0)  # (num_keypoints_inner, C)
             
             # ============= Outer Region (1.0 ~ 2.0 사이) =============
-            # outer box 영역에서 샘플링하되, inner box 영역은 제외
+            # outer box 영역에서 샘플링하되, inner box 영역은 제외하고 이웃 객체와 겹치는 부분을 제거
+            target_outer_count = fallback_outer_count
             if outer_x_sample_num is not None and outer_y_sample_num is not None:
                 xs_o = torch.linspace(-0.5, 0.5, steps=outer_x_sample_num, device=bev_features.device)
                 ys_o = torch.linspace(-0.5, 0.5, steps=outer_y_sample_num, device=bev_features.device)
                 yy_o, xx_o = torch.meshgrid(ys_o, xs_o, indexing='ij')
                 grid_o = torch.stack([xx_o.reshape(-1), yy_o.reshape(-1)], dim=-1)  # (No, 2)
-                # Convert to local coords by scaling with outer dims
                 kp_local_outer_all = grid_o * box_dims_outer.unsqueeze(0)
-                # Mask out points that fall inside the inner box
                 inside_x = torch.abs(kp_local_outer_all[:, 0]) <= (box_dims_inner[0] / 2)
                 inside_y = torch.abs(kp_local_outer_all[:, 1]) <= (box_dims_inner[1] / 2)
                 mask_outer = ~(inside_x & inside_y)
                 keypoints_local_outer = kp_local_outer_all[mask_outer]
-                # Optionally downsample to num_keypoints_outer if provided and smaller
-                if num_keypoints_outer is not None and keypoints_local_outer.shape[0] > num_keypoints_outer:
-                    idx = torch.randperm(keypoints_local_outer.shape[0], device=bev_features.device)[:num_keypoints_outer]
-                    keypoints_local_outer = keypoints_local_outer[idx]
+                if num_keypoints_outer is None:
+                    fallback_outer_count = max(int(keypoints_local_outer.shape[0]), 1)
+                target_outer_count = fallback_outer_count
             else:
-                # Random sampling fallback
-                max_attempts = num_keypoints_outer * 3 if num_keypoints_outer is not None else 2048
+                max_attempts = max(int(target_outer_count) * 10, 2048)
                 outer_keypoints_local = []
                 attempts = 0
-                while (num_keypoints_outer is None or len(outer_keypoints_local) < num_keypoints_outer) and attempts < max_attempts:
-                    candidate = torch.rand(1, 2, device=bev_features.device) - 0.5
+                required = max(int(target_outer_count), 1)
+                while len(outer_keypoints_local) < required and attempts < max_attempts:
+                    candidate = torch.rand(1, 2, device=bev_features.device, dtype=bev_features.dtype) - 0.5
                     candidate = candidate * box_dims_outer.unsqueeze(0)
                     inside_x = torch.abs(candidate[:, 0]) <= (box_dims_inner[0] / 2)
                     inside_y = torch.abs(candidate[:, 1]) <= (box_dims_inner[1] / 2)
-                    if not (inside_x & inside_y).item():
+                    if (inside_x & inside_y).item():
+                        attempts += 1
+                        continue
+                    candidate_world = box_center.unsqueeze(0) + torch.matmul(candidate, rot_mat.T)
+                    keep_mask = mask_out_other_inners(candidate_world, i)
+                    if keep_mask.item():
                         outer_keypoints_local.append(candidate)
                     attempts += 1
                 if len(outer_keypoints_local) == 0:
-                    # Fallback to a single outer corner if extremely degenerate
-                    keypoints_local_outer = (torch.tensor([[0.5, 0.5]], device=bev_features.device) * box_dims_outer.unsqueeze(0))
+                    keypoints_local_outer = torch.empty((0, 2), device=bev_features.device, dtype=bev_features.dtype)
                 else:
                     keypoints_local_outer = torch.cat(outer_keypoints_local, dim=0)
+
             keypoints_rotated_outer = torch.matmul(keypoints_local_outer, rot_mat.T)
             world_coords_outer = box_center.unsqueeze(0) + keypoints_rotated_outer
+
+            if world_coords_outer.shape[0] > 0:
+                keep_mask_outer = mask_out_other_inners(world_coords_outer, i)
+                if keep_mask_outer.shape[0] > 0:
+                    keypoints_local_outer = keypoints_local_outer[keep_mask_outer]
+                    world_coords_outer = world_coords_outer[keep_mask_outer]
+
+            current_outer_count = world_coords_outer.shape[0]
+            if current_outer_count < target_outer_count:
+                needed = target_outer_count - current_outer_count
+                sampled_local_extra, sampled_world_extra = rejection_sample_outer_points(needed)
+                if sampled_local_extra is not None:
+                    keypoints_local_outer = torch.cat([keypoints_local_outer, sampled_local_extra], dim=0)
+                    world_coords_outer = torch.cat([world_coords_outer, sampled_world_extra], dim=0)
+
+            if world_coords_outer.shape[0] == 0:
+                sampled_local, sampled_world = rejection_sample_outer_points(target_outer_count)
+                if sampled_local is not None:
+                    keypoints_local_outer = sampled_local
+                    world_coords_outer = sampled_world
+                else:
+                    corner_offsets = torch.tensor(
+                        [[0.5, 0.0], [-0.5, 0.0], [0.0, 0.5], [0.0, -0.5]],
+                        device=bev_features.device, dtype=bev_features.dtype
+                    ) * box_dims_outer.unsqueeze(0)
+                    keypoints_local_outer = corner_offsets
+                    world_coords_outer = box_center.unsqueeze(0) + torch.matmul(keypoints_local_outer, rot_mat.T)
+
+            keypoints_local_outer, world_coords_outer = adjust_sample_count(
+                keypoints_local_outer, world_coords_outer, target_outer_count
+            )
 
             bev_coords_x_outer = (world_coords_outer[:, 0] - pc_range[0]) / voxel_size_tensor[0]
             bev_coords_y_outer = (world_coords_outer[:, 1] - pc_range[1]) / voxel_size_tensor[1]
@@ -410,9 +514,10 @@ class Radar_Distill(BaseBEVBackboneV2):
             # Get GT boxes and BEV features
             gt_boxes = batch_dict['gt_boxes']
             
-            # Use low-level BEV features for inter-channel distillation
-            teacher_bev_features = low_lidar_bev
-            student_bev_features = low_radar_bev
+            # Use high-level BEV features (DenseEnc outputs) for TiG distillation
+            # to capture semantically richer context along object boundaries.
+            teacher_bev_features = high_lidar_bev
+            student_bev_features = high_radar_bev
             
             # Extract dual region keypoint features from both teacher and student
             teacher_inner_list, teacher_outer_list = extract_dual_region_keypoints(
@@ -489,11 +594,9 @@ class Radar_Distill(BaseBEVBackboneV2):
                         s_inner_norm = F.normalize(f_student_inner, p=2, dim=1)  # (num_keypoints_inner, C)
                         s_outer_norm = F.normalize(f_student_outer, p=2, dim=1)  # (num_keypoints_outer, C)
                         
-                        # 1. Inner Alignment: Student inner를 Teacher inner로 당기기 (normalized)
-                        inner_alignment = F.mse_loss(s_inner_norm, t_inner_norm, reduction='mean')
+                        # inner_alignment = F.mse_loss(s_inner_norm, t_inner_norm, reduction='mean')
                         
-                        # 2. Outer Alignment: Student outer를 Teacher outer로 당기기 (배경 일관성, normalized)
-                        outer_alignment = F.mse_loss(s_outer_norm, t_outer_norm, reduction='mean')
+                        # outer_alignment = F.mse_loss(s_outer_norm, t_outer_norm, reduction='mean')
                         
                         # 3. Boundary Consistency: Teacher의 inner-outer 경계 거리를 Student도 학습
                         
@@ -508,13 +611,12 @@ class Radar_Distill(BaseBEVBackboneV2):
                         cross_boundary_loss = torch.clamp(cross_boundary_sim + contrastive_margin, min=0.0).mean()
                         
                         # Total boundary loss
-                        contrastive_loss = (inner_alignment + outer_alignment + 
-                                          boundary_consistency + cross_boundary_loss) / 4.0
+                        contrastive_loss = boundary_consistency + cross_boundary_loss
                         loss_bev_contrastive += contrastive_loss
                         
                         # Accumulate individual components for logging
-                        loss_inner_align += inner_alignment
-                        loss_outer_align += outer_alignment
+                        # loss_inner_align += inner_alignment
+                        # loss_outer_align += outer_alignment
                         loss_boundary_consist += boundary_consistency
                         loss_cross_boundary += cross_boundary_loss
                         
@@ -524,8 +626,8 @@ class Radar_Distill(BaseBEVBackboneV2):
                 loss_bev_ic = loss_bev_ic / num_objects
                 loss_bev_ik = loss_bev_ik / num_objects
                 loss_bev_contrastive = loss_bev_contrastive / num_objects
-                loss_inner_align = loss_inner_align / num_objects
-                loss_outer_align = loss_outer_align / num_objects
+                # loss_inner_align = loss_inner_align / num_objects
+                # loss_outer_align = loss_outer_align / num_objects
                 loss_boundary_consist = loss_boundary_consist / num_objects
                 loss_cross_boundary = loss_cross_boundary / num_objects
                 
@@ -540,8 +642,8 @@ class Radar_Distill(BaseBEVBackboneV2):
                 tig_distill_dict['loss_bev_ik'] = loss_bev_ik.item()
                 tig_distill_dict['loss_bev_contrastive'] = loss_bev_contrastive.item()
                 # Detailed boundary loss components
-                tig_distill_dict['loss_inner_align'] = loss_inner_align.item()
-                tig_distill_dict['loss_outer_align'] = loss_outer_align.item()
+                # tig_distill_dict['loss_inner_align'] = loss_inner_align.item()
+                # tig_distill_dict['loss_outer_align'] = loss_outer_align.item()
                 tig_distill_dict['loss_boundary_consist'] = loss_boundary_consist.item()
                 tig_distill_dict['loss_cross_boundary'] = loss_cross_boundary.item()
                 
@@ -554,8 +656,8 @@ class Radar_Distill(BaseBEVBackboneV2):
                 tig_distill_dict['loss_bev_ic'] = 0.0
                 tig_distill_dict['loss_bev_ik'] = 0.0
                 tig_distill_dict['loss_bev_contrastive'] = 0.0
-                tig_distill_dict['loss_inner_align'] = 0.0
-                tig_distill_dict['loss_outer_align'] = 0.0
+                # tig_distill_dict['loss_inner_align'] = 0.0
+                # tig_distill_dict['loss_outer_align'] = 0.0
                 tig_distill_dict['loss_boundary_consist'] = 0.0
                 tig_distill_dict['loss_cross_boundary'] = 0.0
                 
