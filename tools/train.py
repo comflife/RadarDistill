@@ -10,6 +10,13 @@ import torch
 import torch.nn as nn
 from tensorboardX import SummaryWriter
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("wandb not installed. Install with: pip install wandb")
+
 from pcdet.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pcdet.datasets import build_dataloader
 from pcdet.models import build_network, model_fn_decorator
@@ -112,6 +119,29 @@ def main():
         os.system('cp %s %s' % (args.cfg_file, output_dir))
 
     tb_log = SummaryWriter(log_dir=str(output_dir / 'tensorboard')) if cfg.LOCAL_RANK == 0 else None
+    
+    # --------------------wandb init----------------------#
+    if cfg.LOCAL_RANK == 0:
+        if WANDB_AVAILABLE:
+            try:
+                current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                name = cfg.TAG + "_" + args.extra_tag + "_" + current_time
+                wandb.init(
+                    project="radardistill",
+                    name=name,
+                    dir=str(output_dir),
+                    entity="4DR_siu",  # Change this to your wandb entity/username
+                    config=vars(cfg)
+                )
+                wandb.config.update(vars(args), allow_val_change=True)
+                logger.info(f"Wandb initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize wandb: {e}")
+        else:
+            logger.warning("wandb is not available. Install with: pip install wandb")
+    else:
+        # Disable wandb for non-zero ranks
+        os.environ['WANDB_SILENT'] = 'true'
 
     logger.info("----------- Create dataloader & network & optimizer -----------")
     train_set, train_loader, train_sampler = build_dataloader(
@@ -124,6 +154,15 @@ def main():
         merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
         total_epochs=args.epochs,
         seed=666 if args.fix_random_seed else None
+    )
+
+    val_set, val_loader, val_sampler = build_dataloader(
+        dataset_cfg=cfg.DATA_CONFIG,
+        class_names=cfg.CLASS_NAMES,
+        batch_size=args.batch_size,
+        dist=dist_train, workers=args.workers,
+        logger=logger,
+        training=False
     )
 
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=train_set)
@@ -196,11 +235,20 @@ def main():
         use_logger_to_record=not args.use_tqdm_to_record, 
         show_gpu_stat=args.wo_gpu_stat,
         use_amp=args.use_amp,
-        cfg=cfg
+        cfg=cfg,
+        val_loader=val_loader
     )
 
     if hasattr(train_set, 'use_shared_memory') and train_set.use_shared_memory:
         train_set.clean_shared_memory()
+
+    # Finish wandb run
+    if cfg.LOCAL_RANK == 0 and WANDB_AVAILABLE:
+        try:
+            wandb.finish()
+            logger.info("Wandb run finished")
+        except:
+            pass
 
     logger.info('**********************End training %s/%s(%s)**********************\n\n\n'
                 % (cfg.EXP_GROUP_PATH, cfg.TAG, args.extra_tag))

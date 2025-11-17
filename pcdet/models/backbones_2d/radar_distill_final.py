@@ -410,9 +410,9 @@ class Radar_Distill(BaseBEVBackboneV2):
             # Get GT boxes and BEV features
             gt_boxes = batch_dict['gt_boxes']
             
-            # Use high-resolution BEV features for inter-channel distillation
-            teacher_bev_features = high_lidar_bev
-            student_bev_features = high_radar_bev
+            # Use low-level BEV features for inter-channel distillation
+            teacher_bev_features = low_lidar_bev
+            student_bev_features = low_radar_bev
             
             # Extract dual region keypoint features from both teacher and student
             teacher_inner_list, teacher_outer_list = extract_dual_region_keypoints(
@@ -435,7 +435,12 @@ class Radar_Distill(BaseBEVBackboneV2):
             # Compute inter-channel and inter-keypoint correlation loss
             loss_bev_ic = 0.0  # inter-channel loss (inner region only)
             loss_bev_ik = 0.0  # inter-keypoint loss (inner region only)
-            loss_bev_contrastive = 0.0  # contrastive loss (push outer region away)
+            loss_bev_contrastive = 0.0  # contrastive loss (boundary learning)
+            # Detailed boundary loss components
+            loss_inner_align = 0.0
+            loss_outer_align = 0.0
+            loss_boundary_consist = 0.0
+            loss_cross_boundary = 0.0
             num_objects = 0
 
             if len(teacher_inner_list) > 0 and len(student_inner_list) > 0:
@@ -461,27 +466,57 @@ class Radar_Distill(BaseBEVBackboneV2):
                         B_student = f_student_inner @ f_student_inner.T  # (num_keypoints_inner, num_keypoints_inner)
                         loss_bev_ik += F.mse_loss(B_teacher, B_student, reduction='mean')
                         
-                        # ============= Outer Region: Contrastive Loss =============
-                        # Goal: Push outer region features away from inner region features
-                        # Method 1: Maximize distance between inner and outer region
-                        # Method 2: Minimize similarity between inner and outer region
-                        # Method 3: Contrastive loss with margin
-                        
+                        # ============= Outer Region: Teacher-Student Boundary Learning =============
+                        # 목표: Teacher의 box 내부/외부 경계 관계를 Student에게 전달
+                        # 
+                        # Contrastive Learning 구성:
+                        # - Anchor: Student inner features (GT box 내부)
+                        # - Positive: Teacher inner features (같은 객체, 정렬 대상)
+                        # - Negative: Outer region features (배경, 구분 대상)
+                        #
+                        # 4가지 Loss Components:
+                        # 1. Inner Alignment: Student inner ↔ Teacher inner (객체 영역 일치)
+                        # 2. Outer Alignment: Student outer ↔ Teacher outer (배경 영역 일치)
+                        # 3. Boundary Consistency: Teacher의 inner-outer 거리 → Student 학습
+                        # 4. Cross-Boundary: Student inner ↔ Teacher outer (경계 명확화)
+                        f_teacher_outer = teacher_outer[obj_idx]  # (num_keypoints_outer, C)
                         f_student_outer = student_outer[obj_idx]  # (num_keypoints_outer, C)
                         
-                        # L2 normalize features for better distance computation
-                        f_inner_norm = F.normalize(f_student_inner, p=2, dim=1)  # (num_keypoints_inner, C)
-                        f_outer_norm = F.normalize(f_student_outer, p=2, dim=1)  # (num_keypoints_outer, C)
+                        # L2 normalize all features for stable and consistent distance computation
+                        # 모든 feature를 normalize하여 방향성(orientation)에 집중하고 스케일 영향 제거
+                        t_inner_norm = F.normalize(f_teacher_inner, p=2, dim=1)  # (num_keypoints_inner, C)
+                        t_outer_norm = F.normalize(f_teacher_outer, p=2, dim=1)  # (num_keypoints_outer, C)
+                        s_inner_norm = F.normalize(f_student_inner, p=2, dim=1)  # (num_keypoints_inner, C)
+                        s_outer_norm = F.normalize(f_student_outer, p=2, dim=1)  # (num_keypoints_outer, C)
                         
-                        # Compute cosine similarity between inner and outer keypoints
-                        # similarity: (num_keypoints_outer, num_keypoints_inner)
-                        similarity = torch.mm(f_outer_norm, f_inner_norm.T)
+                        # 1. Inner Alignment: Student inner를 Teacher inner로 당기기 (normalized)
+                        inner_alignment = F.mse_loss(s_inner_norm, t_inner_norm, reduction='mean')
                         
-                        # Contrastive loss: push outer features away from inner features
-                        # We want low similarity (ideally negative or zero)
-                        # Use margin-based loss: max(0, similarity - margin)
-                        contrastive_loss = torch.clamp(similarity + contrastive_margin, min=0.0).mean()
+                        # 2. Outer Alignment: Student outer를 Teacher outer로 당기기 (배경 일관성, normalized)
+                        outer_alignment = F.mse_loss(s_outer_norm, t_outer_norm, reduction='mean')
+                        
+                        # 3. Boundary Consistency: Teacher의 inner-outer 경계 거리를 Student도 학습
+                        
+                        # Teacher의 inner-outer 평균 거리
+                        teacher_boundary_distance = torch.mm(t_inner_norm, t_outer_norm.T).mean()
+                        # Student의 inner-outer 평균 거리
+                        student_boundary_distance = torch.mm(s_inner_norm, s_outer_norm.T).mean()
+                        boundary_consistency = F.mse_loss(student_boundary_distance, teacher_boundary_distance)
+                        
+                        # 4. Cross-Boundary Contrast: Student inner와 Teacher outer는 멀어야 함
+                        cross_boundary_sim = torch.mm(s_inner_norm, t_outer_norm.T)
+                        cross_boundary_loss = torch.clamp(cross_boundary_sim + contrastive_margin, min=0.0).mean()
+                        
+                        # Total boundary loss
+                        contrastive_loss = (inner_alignment + outer_alignment + 
+                                          boundary_consistency + cross_boundary_loss) / 4.0
                         loss_bev_contrastive += contrastive_loss
+                        
+                        # Accumulate individual components for logging
+                        loss_inner_align += inner_alignment
+                        loss_outer_align += outer_alignment
+                        loss_boundary_consist += boundary_consistency
+                        loss_cross_boundary += cross_boundary_loss
                         
                         num_objects += 1
 
@@ -489,6 +524,10 @@ class Radar_Distill(BaseBEVBackboneV2):
                 loss_bev_ic = loss_bev_ic / num_objects
                 loss_bev_ik = loss_bev_ik / num_objects
                 loss_bev_contrastive = loss_bev_contrastive / num_objects
+                loss_inner_align = loss_inner_align / num_objects
+                loss_outer_align = loss_outer_align / num_objects
+                loss_boundary_consist = loss_boundary_consist / num_objects
+                loss_cross_boundary = loss_cross_boundary / num_objects
                 
                 # Add all losses to total distill_loss
                 distill_loss = distill_loss + \
@@ -500,6 +539,11 @@ class Radar_Distill(BaseBEVBackboneV2):
                 tig_distill_dict['loss_bev_ic'] = loss_bev_ic.item()
                 tig_distill_dict['loss_bev_ik'] = loss_bev_ik.item()
                 tig_distill_dict['loss_bev_contrastive'] = loss_bev_contrastive.item()
+                # Detailed boundary loss components
+                tig_distill_dict['loss_inner_align'] = loss_inner_align.item()
+                tig_distill_dict['loss_outer_align'] = loss_outer_align.item()
+                tig_distill_dict['loss_boundary_consist'] = loss_boundary_consist.item()
+                tig_distill_dict['loss_cross_boundary'] = loss_cross_boundary.item()
                 
                 # Store in batch_dict for pillarnet to use (for backward compatibility)
                 batch_dict['loss_bev_ic'] = loss_bev_ic
@@ -510,6 +554,10 @@ class Radar_Distill(BaseBEVBackboneV2):
                 tig_distill_dict['loss_bev_ic'] = 0.0
                 tig_distill_dict['loss_bev_ik'] = 0.0
                 tig_distill_dict['loss_bev_contrastive'] = 0.0
+                tig_distill_dict['loss_inner_align'] = 0.0
+                tig_distill_dict['loss_outer_align'] = 0.0
+                tig_distill_dict['loss_boundary_consist'] = 0.0
+                tig_distill_dict['loss_cross_boundary'] = 0.0
                 
                 batch_dict['loss_bev_ic'] = torch.tensor(0.0, device=high_radar_bev.device)
                 batch_dict['loss_bev_ik'] = torch.tensor(0.0, device=high_radar_bev.device)

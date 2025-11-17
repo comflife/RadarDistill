@@ -132,6 +132,32 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                 for key, val in tb_dict.items():
                     tb_log.add_scalar('train/' + key, val, accumulated_iter)
             
+            # Log to wandb
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb_log_dict = {
+                        'train/loss': loss.item(),
+                        'train/learning_rate': cur_lr,
+                        'train/epoch': cur_epoch,
+                        'train/iter': accumulated_iter,
+                        'train/data_time': data_time.avg,
+                        'train/forward_time': forward_time.avg,
+                        'train/batch_time': batch_time.avg,
+                    }
+                    # Add all metrics from tb_dict
+                    for key, val in tb_dict.items():
+                        if isinstance(val, (int, float)):
+                            wandb_log_dict[f'train/{key}'] = val
+                    
+                    try:
+                        wandb.log(wandb_log_dict, step=accumulated_iter)
+                    except Exception as e:
+                        if logger is not None:
+                            logger.warning(f"Failed to log to wandb: {e}")
+            except ImportError:
+                pass
+            
             # save intermediate ckpt every {ckpt_save_time_interval} seconds         
             time_past_this_epoch = pbar.format_dict['elapsed']
             if time_past_this_epoch // ckpt_save_time_interval >= ckpt_save_cnt:
@@ -151,7 +177,7 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 start_epoch, total_epochs, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
                 merge_all_iters_to_one_epoch=False, use_amp=False,
-                use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, cfg=None):
+                use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, cfg=None, val_loader=None):
     accumulated_iter = start_iter
 
     # use for disable data augmentation hook
