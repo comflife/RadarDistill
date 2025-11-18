@@ -4,8 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pcdet.utils.box_utils import center_to_corner_box2d
 from ...ops.basicblock.modules.Basicblock_convn import ConvNeXtBlock
+from ...ops.roiaware_pool3d import roiaware_pool3d_utils
 from functools import partial
-import cv2
 from .base_bev_backbone import BaseBEVBackboneV2
 
 
@@ -347,33 +347,125 @@ class Radar_Distill(BaseBEVBackboneV2):
         self.voxel_size = self.model_cfg.VOXEL_SIZE
         self.point_cloud_range = self.model_cfg.POINT_CLOUD_RANGE
     
+    def _get_bev_world_grid(self, H, W, device, dtype):
+        x_min, y_min = self.point_cloud_range[0], self.point_cloud_range[1]
+        x_max, y_max = self.point_cloud_range[3], self.point_cloud_range[4]
+
+        # 각 픽셀은 동일 간격으로 다운샘플된 BEV 셀을 의미하므로 전체 범위/해상도로 스케일을 계산
+        step_x = (x_max - x_min) / max(W, 1)
+        step_y = (y_max - y_min) / max(H, 1)
+
+        x_coords = torch.linspace(
+            x_min + 0.5 * step_x, x_max - 0.5 * step_x, steps=W, device=device, dtype=dtype
+        )
+        y_coords = torch.linspace(
+            y_min + 0.5 * step_y, y_max - 0.5 * step_y, steps=H, device=device, dtype=dtype
+        )
+        yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+        return torch.stack([xx, yy], dim=-1)  # (H, W, 2)
+
+    @torch.no_grad()
+    def _build_gt_radar_distribution(self, batch_dict, H, W, device, dtype):
+        batch_size = batch_dict['batch_size']
+        density_map = torch.zeros((batch_size, 1, H, W), device=device, dtype=dtype)
+
+        radar_points = batch_dict.get('radar_points', None)
+        if radar_points is None:
+            return density_map
+
+        if not torch.is_tensor(radar_points):
+            radar_points = torch.from_numpy(radar_points)
+
+        radar_points = radar_points.to(device=device)
+        if radar_points.dtype != torch.float32:
+            radar_points = radar_points.float()
+
+        if radar_points.shape[0] == 0:
+            return density_map
+
+        gt_boxes = batch_dict['gt_boxes']
+        if not torch.is_tensor(gt_boxes):
+            gt_boxes = torch.from_numpy(gt_boxes).to(device=device, dtype=dtype)
+        else:
+            gt_boxes = gt_boxes.to(device=device, dtype=dtype)
+
+        pc_range = self.point_cloud_range
+        x_min, y_min = pc_range[0], pc_range[1]
+        x_max, y_max = pc_range[3], pc_range[4]
+        x_range = max(x_max - x_min, 1e-4)
+        y_range = max(y_max - y_min, 1e-4)
+
+        batch_indices = radar_points[:, 0].long()
+
+        for b in range(batch_size):
+            valid_box_mask = gt_boxes[b].sum(dim=1) != 0
+            if not valid_box_mask.any():
+                continue
+
+            boxes = gt_boxes[b][valid_box_mask][:, :7].contiguous()
+            point_mask = batch_indices == b
+            if not point_mask.any():
+                continue
+
+            batch_pts = radar_points[point_mask][:, 1:4]
+            pts_expanded = batch_pts.unsqueeze(0)
+            boxes_expanded = boxes.unsqueeze(0)
+            box_indices = roiaware_pool3d_utils.points_in_boxes_gpu(
+                pts_expanded.contiguous(), boxes_expanded.contiguous()
+            ).squeeze(0)
+
+            inside_mask = box_indices >= 0
+            if not inside_mask.any():
+                continue
+
+            inside_pts = batch_pts[inside_mask]
+            x_idx = ((inside_pts[:, 0] - x_min) / x_range * W).long().clamp(min=0, max=W - 1)
+            y_idx = ((inside_pts[:, 1] - y_min) / y_range * H).long().clamp(min=0, max=H - 1)
+            flat_indices = y_idx * W + x_idx
+
+            density_map[b, 0].view(-1).scatter_add_(
+                0,
+                flat_indices,
+                torch.ones_like(flat_indices, dtype=density_map.dtype)
+            )
+
+        max_vals = density_map.view(batch_size, -1).amax(dim=1).view(batch_size, 1, 1, 1)
+        density_map = density_map / (max_vals + 1e-6)
+        return density_map
     
-    def low_loss(self, lidar_bev, radar_bev):
+    
+    def low_loss(self, lidar_bev, radar_bev, batch_dict):
 
         B, _, H, W = radar_bev.shape
+
         lidar_mask = (lidar_bev.sum(1).unsqueeze(1) > 0).float()
-        
-        radar_mask = (radar_bev.sum(1).unsqueeze(1))
-        
-        activate_map = (radar_mask > 0).float() + lidar_mask * 0.5
+        radar_mask = radar_bev.sum(1, keepdim=True)
+
+        radar_distribution = self._build_gt_radar_distribution(
+            batch_dict, H, W, lidar_bev.device, lidar_bev.dtype
+        )
+
+        gt_box_mask = (radar_distribution > 0).float()
+        guided_lidar_mask = lidar_mask * (1 - gt_box_mask) + lidar_mask * radar_distribution
+
+        activate_map = (radar_mask > 0).float() + guided_lidar_mask * 0.5
 
         mask_radar_lidar = torch.zeros_like(activate_map, dtype=torch.float)
         mask_radar_de_lidar = torch.zeros_like(activate_map, dtype=torch.float)
-        mask_radar_lidar[activate_map==1.5] = 1
-        mask_radar_de_lidar[activate_map==1.0] = 1
+        mask_radar_lidar[activate_map == 1.5] = 1
+        mask_radar_de_lidar[activate_map == 1.0] = 1
 
-        mask_radar_de_lidar *= (mask_radar_lidar.sum() / mask_radar_de_lidar.sum())
+        if mask_radar_de_lidar.sum() > 0:
+            mask_radar_de_lidar *= (mask_radar_lidar.sum() / (mask_radar_de_lidar.sum() + 1e-6))
 
         loss_radar_lidar = F.mse_loss(radar_bev, lidar_bev, reduction='none')
-        loss_radar_lidar = torch.sum(loss_radar_lidar * mask_radar_lidar) / B
-        
-        loss_radar_de_lidar = F.mse_loss(radar_bev, lidar_bev, reduction='none')
-        loss_radar_de_lidar = torch.sum(loss_radar_de_lidar * mask_radar_de_lidar) / B
+        loss_radar_lidar = torch.sum(loss_radar_lidar * mask_radar_lidar) / max(B, 1)
 
-        # breakpoint()
+        loss_radar_de_lidar = F.mse_loss(radar_bev, lidar_bev, reduction='none')
+        loss_radar_de_lidar = torch.sum(loss_radar_de_lidar * mask_radar_de_lidar) / max(B, 1)
+
         feature_loss = 3e-4 * loss_radar_lidar + 5e-5 * loss_radar_de_lidar
-        loss = nn.L1Loss()
-        mask_loss = loss(radar_mask.sigmoid(), lidar_mask)
+        mask_loss = nn.L1Loss()(radar_mask.sigmoid(), guided_lidar_mask)
 
         return feature_loss, mask_loss
     
@@ -420,11 +512,12 @@ class Radar_Distill(BaseBEVBackboneV2):
         high_lidar_bev_8x = batch_dict['spatial_features_2d_8x']
         radar_pred_dicts = batch_dict['radar_pred_dicts']
         gt_heatmaps = batch_dict['target_dicts']['heatmaps']
+        gt_boxes = batch_dict['gt_boxes']
         
         B, _, H, W = low_radar_bev.shape
         
-        feature_loss, mask_loss = self.low_loss(low_lidar_bev, low_radar_bev)
-        de_8x_feature_loss, de_8x_mask_loss = self.low_loss(low_lidar_bev, low_radar_de_8x)
+        feature_loss, mask_loss = self.low_loss(low_lidar_bev, low_radar_bev, batch_dict)
+        de_8x_feature_loss, de_8x_mask_loss = self.low_loss(low_lidar_bev, low_radar_de_8x, batch_dict)
 
         
         high_distill_loss = self.high_loss(high_radar_bev,high_radar_bev_8x, high_lidar_bev,high_lidar_bev_8x, gt_heatmaps, radar_pred_dicts)
@@ -452,8 +545,6 @@ class Radar_Distill(BaseBEVBackboneV2):
             contrastive_margin = distill_cfg.get('CONTRASTIVE_MARGIN', 1.0)
             
             # Get GT boxes and BEV features
-            gt_boxes = batch_dict['gt_boxes']
-            
             # Use high-level BEV features (DenseEnc outputs) for TiG distillation
             # to capture semantically richer context along object boundaries.
             teacher_bev_features = high_lidar_bev
