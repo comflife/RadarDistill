@@ -12,20 +12,7 @@ from .base_bev_backbone import BaseBEVBackboneV2
 def extract_keypoint_features_from_bev(
     bev_features, gt_boxes, point_cloud_range, voxel_size, num_keypoints=256, enlarge_factor=1.0
 ):
-    """
-    주어진 GT 박스 영역 내에서 BEV 피처를 추출합니다. (TiGDistill-BEV 논문 참고)
     
-    Args:
-        bev_features: (B, C, H, W) BEV feature map
-        gt_boxes: (B, N, 8) GT boxes [x, y, z, dx, dy, dz, heading, class_id]
-        point_cloud_range: [x_min, y_min, z_min, x_max, y_max, z_max]
-        voxel_size: [vx, vy, vz]
-        num_keypoints: number of keypoints to sample per box
-        enlarge_factor: factor to enlarge the box region
-        
-    Returns:
-        keypoint_features_list: list of (N_boxes, num_keypoints, C) per batch
-    """
     batch_size, num_channels, H, W = bev_features.shape
     keypoint_features_list = []
 
@@ -94,261 +81,198 @@ def extract_dual_region_keypoints(
     inner_factor=1.0, outer_factor=2.0,
     x_sample_num: int = None, y_sample_num: int = None,
     outer_x_sample_num: int = None, outer_y_sample_num: int = None,
+    # 추가 옵션 (Config로 관리 권장)
+    chunk_size: int = 8192,
+    oversample_rate: float = 3.0,
+    deterministic: bool = False 
 ):
-    """
-    GT 박스에서 두 개의 영역(inner, outer)에서 keypoint를 추출합니다.
-    
-    Args:
-        bev_features: (B, C, H, W) BEV feature map
-        gt_boxes: (B, N, 8) GT boxes [x, y, z, dx, dy, dz, heading, class_id]
-        point_cloud_range: [x_min, y_min, z_min, x_max, y_max, z_max]
-        voxel_size: [vx, vy, vz]
-        num_keypoints_inner: inner region에서 샘플링할 keypoint 수
-        num_keypoints_outer: outer region에서 샘플링할 keypoint 수
-        inner_factor: inner box의 enlarge factor (기본 1.0 = GT box)
-        outer_factor: outer box의 enlarge factor (기본 2.0)
-        
-    Returns:
-        inner_keypoints_list: list of (N_boxes, Nin, C) per batch (GT box 내부)
-        outer_keypoints_list: list of (N_boxes, Nout, C) per batch (1.0~2.0 사이)
-    """
     batch_size, num_channels, H, W = bev_features.shape
     inner_keypoints_list = []
     outer_keypoints_list = []
 
-    pc_range = torch.tensor(point_cloud_range, device=bev_features.device)
-    voxel_size_tensor = torch.tensor(voxel_size, device=bev_features.device)
-    fallback_outer_count = num_keypoints_outer if num_keypoints_outer is not None else max(num_keypoints_inner, 1)
+    device = bev_features.device
+    dtype = bev_features.dtype
+    pc_range = torch.tensor(point_cloud_range, device=device, dtype=dtype)
+    voxel_size_tensor = torch.tensor(voxel_size, device=device, dtype=dtype)
+    
+    target_outer = num_keypoints_outer if num_keypoints_outer is not None else max(num_keypoints_inner, 1)
+
+    # [Helper] 좌표 정규화 함수
+    def get_normalized_grid(world_coords):
+        bev_coords_x = (world_coords[..., 0] - pc_range[0]) / voxel_size_tensor[0]
+        bev_coords_y = (world_coords[..., 1] - pc_range[1]) / voxel_size_tensor[1]
+        norm_x = (bev_coords_x / (W - 1)) * 2.0 - 1.0
+        norm_y = (bev_coords_y / (H - 1)) * 2.0 - 1.0
+        return torch.stack([norm_x, norm_y], dim=-1)
 
     for b in range(batch_size):
-        batch_bev_features = bev_features[b]  # (C, H, W)
-        batch_gt_boxes = gt_boxes[b]  # (N, 8)
+        batch_bev = bev_features[b:b+1]
+        batch_boxes = gt_boxes[b]
 
-        # 유효한 GT 박스만 선택
-        mask = batch_gt_boxes.sum(dim=1) != 0
-        valid_gt_boxes = batch_gt_boxes[mask]
+        mask = batch_boxes.sum(dim=1) != 0
+        valid_boxes = batch_boxes[mask]
+        num_valid = valid_boxes.shape[0]
 
-        if valid_gt_boxes.shape[0] == 0:
+        if num_valid == 0:
             continue
 
-        centers_all = valid_gt_boxes[:, 0:2]
-        inner_dims_all = valid_gt_boxes[:, 3:5] * inner_factor
-        angles_all = valid_gt_boxes[:, 6]
-        cos_all = torch.cos(angles_all)
-        sin_all = torch.sin(angles_all)
-
-        def mask_out_other_inners(points_world, current_idx):
-            if points_world.shape[0] == 0 or valid_gt_boxes.shape[0] <= 1:
-                return torch.ones(points_world.shape[0], dtype=torch.bool, device=points_world.device)
-            keep_mask = torch.ones(points_world.shape[0], dtype=torch.bool, device=points_world.device)
-            for other_idx in range(valid_gt_boxes.shape[0]):
-                if other_idx == current_idx:
-                    continue
-                rel = points_world - centers_all[other_idx]
-                rot = torch.stack([
-                    torch.stack([cos_all[other_idx], sin_all[other_idx]], dim=0),
-                    torch.stack([-sin_all[other_idx], cos_all[other_idx]], dim=0)
-                ], dim=0)
-                local = torch.matmul(rel, rot)
-                inside_x = torch.abs(local[:, 0]) <= (inner_dims_all[other_idx, 0] / 2)
-                inside_y = torch.abs(local[:, 1]) <= (inner_dims_all[other_idx, 1] / 2)
-                keep_mask &= ~(inside_x & inside_y)
-                if not keep_mask.any():
-                    break
-            return keep_mask
-
-        def adjust_sample_count(local_pts, world_pts, target_count):
-            if target_count is None or local_pts.shape[0] == target_count:
-                return local_pts, world_pts
-            if local_pts.shape[0] == 0:
-                return local_pts, world_pts
-            device = local_pts.device
-            target_count = int(target_count)
-            if local_pts.shape[0] > target_count:
-                idx = torch.randperm(local_pts.shape[0], device=device)[:target_count]
-                return local_pts[idx], world_pts[idx]
-            repeat_count = target_count - local_pts.shape[0]
-            repeat_idx = torch.randint(0, local_pts.shape[0], (repeat_count,), device=device)
-            local_pts = torch.cat([local_pts, local_pts[repeat_idx]], dim=0)
-            world_pts = torch.cat([world_pts, world_pts[repeat_idx]], dim=0)
-            return local_pts, world_pts
-
-        inner_box_keypoints_list = []
-        outer_box_keypoints_list = []
+        centers = valid_boxes[:, 0:2]
+        dims = valid_boxes[:, 3:5]
+        angles = valid_boxes[:, 6]
         
-        for i in range(valid_gt_boxes.shape[0]):
-            box = valid_gt_boxes[i]
-            box_center = box[0:2]  # (x, y)
-            box_dims_inner = box[3:5] * inner_factor  # (dx, dy) * 1.0
-            box_dims_outer = box[3:5] * outer_factor  # (dx, dy) * 2.0
-            box_angle = box[6]  # heading
-
-            # Rotation matrix
-            rot_sin, rot_cos = torch.sin(box_angle), torch.cos(box_angle)
-            rot_mat = torch.stack([
-                torch.stack([rot_cos, -rot_sin], dim=0),
-                torch.stack([rot_sin, rot_cos], dim=0)
-            ], dim=0)
-
-            def rejection_sample_outer_points(required_count):
-                target = max(int(required_count), 1)
-                samples_local = []
-                attempts = 0
-                max_attempts = max(target * 50, 2000)
-                while len(samples_local) < target and attempts < max_attempts:
-                    candidate_local = (torch.rand(1, 2, device=bev_features.device, dtype=bev_features.dtype) - 0.5)
-                    candidate_local = candidate_local * box_dims_outer.unsqueeze(0)
-                    inside_self_x = torch.abs(candidate_local[:, 0]) <= (box_dims_inner[0] / 2)
-                    inside_self_y = torch.abs(candidate_local[:, 1]) <= (box_dims_inner[1] / 2)
-                    if (inside_self_x & inside_self_y).item():
-                        attempts += 1
-                        continue
-                    candidate_world = box_center.unsqueeze(0) + torch.matmul(candidate_local, rot_mat.T)
-                    keep_mask = mask_out_other_inners(candidate_world, i)
-                    if keep_mask.item():
-                        samples_local.append(candidate_local)
-                    attempts += 1
-                if len(samples_local) == 0:
-                    return None, None
-                samples_local = torch.cat(samples_local, dim=0)
-                samples_world = box_center.unsqueeze(0) + torch.matmul(samples_local, rot_mat.T)
-                return samples_local, samples_world
-
-            # ============= Inner Region (GT box 내부) =============
-            if x_sample_num is not None and y_sample_num is not None:
-                # Deterministic grid sampling (e.g., 24x24)
-                xs = torch.linspace(-0.5, 0.5, steps=x_sample_num, device=bev_features.device)
-                ys = torch.linspace(-0.5, 0.5, steps=y_sample_num, device=bev_features.device)
-                yy, xx = torch.meshgrid(ys, xs, indexing='ij')  # (y_sample_num, x_sample_num)
-                grid = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)  # (N, 2) in [-0.5, 0.5]
-                keypoints_local_inner = grid * box_dims_inner.unsqueeze(0)
-            else:
-                # Random sampling fallback
-                keypoints_local_inner = torch.rand(num_keypoints_inner, 2, device=bev_features.device) - 0.5
-                keypoints_local_inner *= box_dims_inner.unsqueeze(0)
-            keypoints_rotated_inner = torch.matmul(keypoints_local_inner, rot_mat.T)
-            world_coords_inner = box_center.unsqueeze(0) + keypoints_rotated_inner
-
-            bev_coords_x_inner = (world_coords_inner[:, 0] - pc_range[0]) / voxel_size_tensor[0]
-            bev_coords_y_inner = (world_coords_inner[:, 1] - pc_range[1]) / voxel_size_tensor[1]
-            normalized_x_inner = (bev_coords_x_inner / (W - 1)) * 2.0 - 1.0
-            normalized_y_inner = (bev_coords_y_inner / (H - 1)) * 2.0 - 1.0
-            grid_inner = torch.stack([normalized_x_inner, normalized_y_inner], dim=1).unsqueeze(0).unsqueeze(0)
-
-            sampled_features_inner = F.grid_sample(
-                batch_bev_features.unsqueeze(0),
-                grid_inner,
-                mode='bilinear',
-                align_corners=True
-            ).squeeze(0).squeeze(1).permute(1, 0)  # (num_keypoints_inner, C)
-            
-            # ============= Outer Region (1.0 ~ 2.0 사이) =============
-            # outer box 영역에서 샘플링하되, inner box 영역은 제외하고 이웃 객체와 겹치는 부분을 제거
-            target_outer_count = fallback_outer_count
-            if outer_x_sample_num is not None and outer_y_sample_num is not None:
-                xs_o = torch.linspace(-0.5, 0.5, steps=outer_x_sample_num, device=bev_features.device)
-                ys_o = torch.linspace(-0.5, 0.5, steps=outer_y_sample_num, device=bev_features.device)
-                yy_o, xx_o = torch.meshgrid(ys_o, xs_o, indexing='ij')
-                grid_o = torch.stack([xx_o.reshape(-1), yy_o.reshape(-1)], dim=-1)  # (No, 2)
-                kp_local_outer_all = grid_o * box_dims_outer.unsqueeze(0)
-                inside_x = torch.abs(kp_local_outer_all[:, 0]) <= (box_dims_inner[0] / 2)
-                inside_y = torch.abs(kp_local_outer_all[:, 1]) <= (box_dims_inner[1] / 2)
-                mask_outer = ~(inside_x & inside_y)
-                keypoints_local_outer = kp_local_outer_all[mask_outer]
-                if num_keypoints_outer is None:
-                    fallback_outer_count = max(int(keypoints_local_outer.shape[0]), 1)
-                target_outer_count = fallback_outer_count
-            else:
-                max_attempts = max(int(target_outer_count) * 10, 2048)
-                outer_keypoints_local = []
-                attempts = 0
-                required = max(int(target_outer_count), 1)
-                while len(outer_keypoints_local) < required and attempts < max_attempts:
-                    candidate = torch.rand(1, 2, device=bev_features.device, dtype=bev_features.dtype) - 0.5
-                    candidate = candidate * box_dims_outer.unsqueeze(0)
-                    inside_x = torch.abs(candidate[:, 0]) <= (box_dims_inner[0] / 2)
-                    inside_y = torch.abs(candidate[:, 1]) <= (box_dims_inner[1] / 2)
-                    if (inside_x & inside_y).item():
-                        attempts += 1
-                        continue
-                    candidate_world = box_center.unsqueeze(0) + torch.matmul(candidate, rot_mat.T)
-                    keep_mask = mask_out_other_inners(candidate_world, i)
-                    if keep_mask.item():
-                        outer_keypoints_local.append(candidate)
-                    attempts += 1
-                if len(outer_keypoints_local) == 0:
-                    keypoints_local_outer = torch.empty((0, 2), device=bev_features.device, dtype=bev_features.dtype)
-                else:
-                    keypoints_local_outer = torch.cat(outer_keypoints_local, dim=0)
-
-            keypoints_rotated_outer = torch.matmul(keypoints_local_outer, rot_mat.T)
-            world_coords_outer = box_center.unsqueeze(0) + keypoints_rotated_outer
-
-            if world_coords_outer.shape[0] > 0:
-                keep_mask_outer = mask_out_other_inners(world_coords_outer, i)
-                if keep_mask_outer.shape[0] > 0:
-                    keypoints_local_outer = keypoints_local_outer[keep_mask_outer]
-                    world_coords_outer = world_coords_outer[keep_mask_outer]
-
-            current_outer_count = world_coords_outer.shape[0]
-            if current_outer_count < target_outer_count:
-                needed = target_outer_count - current_outer_count
-                sampled_local_extra, sampled_world_extra = rejection_sample_outer_points(needed)
-                if sampled_local_extra is not None:
-                    keypoints_local_outer = torch.cat([keypoints_local_outer, sampled_local_extra], dim=0)
-                    world_coords_outer = torch.cat([world_coords_outer, sampled_world_extra], dim=0)
-
-            if world_coords_outer.shape[0] == 0:
-                sampled_local, sampled_world = rejection_sample_outer_points(target_outer_count)
-                if sampled_local is not None:
-                    keypoints_local_outer = sampled_local
-                    world_coords_outer = sampled_world
-                else:
-                    corner_offsets = torch.tensor(
-                        [[0.5, 0.0], [-0.5, 0.0], [0.0, 0.5], [0.0, -0.5]],
-                        device=bev_features.device, dtype=bev_features.dtype
-                    ) * box_dims_outer.unsqueeze(0)
-                    keypoints_local_outer = corner_offsets
-                    world_coords_outer = box_center.unsqueeze(0) + torch.matmul(keypoints_local_outer, rot_mat.T)
-
-            keypoints_local_outer, world_coords_outer = adjust_sample_count(
-                keypoints_local_outer, world_coords_outer, target_outer_count
-            )
-
-            bev_coords_x_outer = (world_coords_outer[:, 0] - pc_range[0]) / voxel_size_tensor[0]
-            bev_coords_y_outer = (world_coords_outer[:, 1] - pc_range[1]) / voxel_size_tensor[1]
-            normalized_x_outer = (bev_coords_x_outer / (W - 1)) * 2.0 - 1.0
-            normalized_y_outer = (bev_coords_y_outer / (H - 1)) * 2.0 - 1.0
-            grid_outer = torch.stack([normalized_x_outer, normalized_y_outer], dim=1).unsqueeze(0).unsqueeze(0)
-
-            sampled_features_outer = F.grid_sample(
-                batch_bev_features.unsqueeze(0),
-                grid_outer,
-                mode='bilinear',
-                align_corners=True
-            ).squeeze(0).squeeze(1).permute(1, 0)  # (num_keypoints_outer, C)
-            
-            inner_box_keypoints_list.append(sampled_features_inner)
-            outer_box_keypoints_list.append(sampled_features_outer)
+        dims_inner = dims * inner_factor
+        dims_outer = dims * outer_factor
         
-        if len(inner_box_keypoints_list) > 0:
-            inner_keypoints_list.append(torch.stack(inner_box_keypoints_list))
-            outer_keypoints_list.append(torch.stack(outer_box_keypoints_list))
+        cos_a = torch.cos(angles)
+        sin_a = torch.sin(angles)
+        rot_mat = torch.stack([
+            torch.stack([cos_a, -sin_a], dim=-1),
+            torch.stack([sin_a, cos_a], dim=-1)
+        ], dim=1)
 
-    return inner_keypoints_list, outer_keypoints_list
+        # =======================================================
+        # 1. Inner Region (Grid or Random)
+        # =======================================================
+        if x_sample_num is not None and y_sample_num is not None:
+            # Grid Sampling
+            xs = torch.linspace(-0.5, 0.5, steps=x_sample_num, device=device, dtype=dtype)
+            ys = torch.linspace(-0.5, 0.5, steps=y_sample_num, device=device, dtype=dtype)
+            yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+            base_grid = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
+            local_inner = base_grid.unsqueeze(0) * dims_inner.unsqueeze(1)
+        else:
+            # Random Sampling
+            rand_pts = torch.rand(num_valid, num_keypoints_inner, 2, device=device, dtype=dtype) - 0.5
+            local_inner = rand_pts * dims_inner.unsqueeze(1)
 
+        pts_rotated_inner = torch.matmul(local_inner, rot_mat.transpose(1, 2))
+        world_inner = centers.unsqueeze(1) + pts_rotated_inner
+        
+        features_inner = F.grid_sample(
+            batch_bev, get_normalized_grid(world_inner).unsqueeze(0), 
+            mode='bilinear', align_corners=True
+        ).squeeze(0).permute(1, 2, 0)
+        inner_keypoints_list.append(features_inner)
+
+        # =======================================================
+        # 2. Outer Region (Grid or Random) - Optimized
+        # =======================================================
+        
+        # A. 후보 점(Candidate) 생성
+        if outer_x_sample_num is not None and outer_y_sample_num is not None:
+            # [Grid Mode] 일정한 간격
+            xs_o = torch.linspace(-0.5, 0.5, steps=outer_x_sample_num, device=device, dtype=dtype)
+            ys_o = torch.linspace(-0.5, 0.5, steps=outer_y_sample_num, device=device, dtype=dtype)
+            yy_o, xx_o = torch.meshgrid(ys_o, xs_o, indexing='ij')
+            base_grid_o = torch.stack([xx_o.reshape(-1), yy_o.reshape(-1)], dim=-1) # (K_grid, 2)
+            
+            # 모든 박스에 대해 Grid 복제
+            local_outer_cand = base_grid_o.unsqueeze(0) * dims_outer.unsqueeze(1) # (N, K_grid, 2)
+            num_cand = local_outer_cand.shape[1]
+            use_random_score = False # Grid 모드면 굳이 섞을 필요 없음 (옵션)
+        else:
+            # [Random Mode]
+            num_cand = int(target_outer * oversample_rate)
+            rand_pts_o = torch.rand(num_valid, num_cand, 2, device=device, dtype=dtype) - 0.5
+            local_outer_cand = rand_pts_o * dims_outer.unsqueeze(1)
+            use_random_score = not deterministic
+
+        # B. 마스킹 1: 자기 자신의 Inner 영역 제외 (Donut Shape)
+        half_inner = dims_inner / 2.0
+        inside_self = (torch.abs(local_outer_cand[..., 0]) <= half_inner[:, 0:1]) & \
+                      (torch.abs(local_outer_cand[..., 1]) <= half_inner[:, 1:2])
+
+        # C. 좌표 변환 (Local -> World)
+        pts_rotated_outer = torch.matmul(local_outer_cand, rot_mat.transpose(1, 2))
+        world_outer_cand = centers.unsqueeze(1) + pts_rotated_outer
+        
+        # D. 마스킹 2: 다른 박스 침범 여부 (Global Check)
+        flat_candidates = world_outer_cand.view(-1, 2)
+        is_collision_flat = torch.zeros(flat_candidates.shape[0], dtype=torch.bool, device=device)
+        half_dims_inner_all = dims_inner / 2.0
+
+        # 메모리 절약을 위한 Chunk 처리
+        for i in range(0, flat_candidates.shape[0], chunk_size):
+            chunk_pts = flat_candidates[i : i + chunk_size]
+            # (N, chunk, 2) - 모든 박스와 비교
+            rel_pos = chunk_pts.unsqueeze(0) - centers.unsqueeze(1)
+            local_pos = torch.einsum('ncj, nkj -> nck', rel_pos, rot_mat)
+            
+            # 박스 내부인지 확인
+            in_box = (torch.abs(local_pos[..., 0]) <= half_dims_inner_all[:, 0:1]) & \
+                     (torch.abs(local_pos[..., 1]) <= half_dims_inner_all[:, 1:2])
+            
+            # 어떤 박스라도 침범했으면 Collision
+            is_collision_flat[i : i + chunk_size] = in_box.any(dim=0)
+
+        is_collision = is_collision_flat.view(num_valid, num_cand)
+        
+        # 최종 Invalid Mask (True = 쓸 수 없는 점)
+        invalid_mask = inside_self | is_collision
+
+        # E. 점 선택 (Selection)
+        # 유효한 점(False)을 우선순위로 둠
+        valid_score = (~invalid_mask).float()
+        
+        if use_random_score:
+            # Random 모드면 점수가 같을 때 랜덤하게 섞임
+            valid_score += torch.rand_like(valid_score) * 0.1
+        else:
+            # Grid 모드면 원래 순서(좌상단 -> 우하단 등)를 유지하거나
+            # 중심에서 먼 순서 등 규칙을 줄 수 있음. 여기선 원래 순서 유지.
+            # topk는 stable하지 않을 수 있으므로, index를 아주 작게 더해서 순서 보존
+            # (여기서는 간단히 처리)
+            pass
+
+        # 점수가 높은(유효한) 순서대로 정렬
+        _, sorted_indices = torch.topk(valid_score, k=num_cand, dim=1)
+        
+        # Fallback Logic: 유효한 점이 부족하면, 유효한 점들을 반복해서 채움
+        num_valid_per_box = (~invalid_mask).sum(dim=1)
+        
+        idx_grid = torch.arange(target_outer, device=device).unsqueeze(0).expand(num_valid, -1)
+        safe_num_valid = num_valid_per_box.clamp(min=1).unsqueeze(1)
+        
+        # Modulo 연산으로 유효 인덱스 순환 (Grid 모드에서도 유효한 점들만 앞에서부터 반복됨)
+        refined_indices_pos = idx_grid % safe_num_valid
+        
+        # sorted_indices의 앞부분(Valid)만 가져오기
+        final_indices = torch.gather(sorted_indices, 1, refined_indices_pos)
+        
+        final_world_outer = torch.gather(
+            world_outer_cand, 1, 
+            final_indices.unsqueeze(-1).expand(-1, -1, 2)
+        )
+
+        # Corner Fallback (완전히 망한 박스 구제용)
+        zero_valid_mask = (num_valid_per_box == 0)
+        if zero_valid_mask.any():
+             corner_signs = torch.tensor([[1, 1], [1, -1], [-1, 1], [-1, -1]], device=device, dtype=dtype) * 0.5
+             corners_local = corner_signs.unsqueeze(0).repeat(1, (target_outer + 3) // 4, 1)[:, :target_outer, :]
+             bad_indices = torch.nonzero(zero_valid_mask).squeeze(1)
+             
+             c_local = corners_local.repeat(bad_indices.shape[0], 1, 1) * dims_outer[bad_indices].unsqueeze(1)
+             c_rot = rot_mat[bad_indices]
+             c_center = centers[bad_indices]
+             c_world = c_center.unsqueeze(1) + torch.matmul(c_local, c_rot.transpose(1, 2))
+             final_world_outer[bad_indices] = c_world
+
+        # F. Feature Sampling
+        features_outer = F.grid_sample(
+            batch_bev, get_normalized_grid(final_world_outer).unsqueeze(0), 
+            mode='bilinear', align_corners=True
+        ).squeeze(0).permute(1, 2, 0)
+
+        outer_keypoints_list.append(features_outer)
+
+    if len(inner_keypoints_list) > 0:
+        return inner_keypoints_list, outer_keypoints_list
+    else:
+        return [], []
+    
 
 def clip_sigmoid(x, eps=1e-4):
-    """Sigmoid function for input feature.
-
-    Args:
-        x (torch.Tensor): Input feature map with the shape of [B, N, H, W].
-        eps (float): Lower bound of the range to be clamped to. Defaults
-            to 1e-4.
-
-    Returns:
-        torch.Tensor: Feature map after sigmoid.
-    """
+    
     # FIXME change back!
     # y = torch.clamp(x.sigmoid_(), min=eps, max=1 - eps)
     y = torch.clamp(x.sigmoid(), min=eps, max=1 - eps)
@@ -356,17 +280,7 @@ def clip_sigmoid(x, eps=1e-4):
 
 
 def compute_kl_loss(student_logits, teacher_logits, temperature=1.0):
-    """
-    KL Divergence Loss for Knowledge Distillation
     
-    Args:
-        student_logits: (B, N) or (N, M) raw scores (before softmax)
-        teacher_logits: (B, N) or (N, M) raw scores (before softmax)
-        temperature: Softening factor (보통 2.0 ~ 4.0 사용)
-    
-    Returns:
-        KL divergence loss (scalar)
-    """
     # 1. Student는 LogSoftmax, Teacher는 Softmax를 취해야 함 (KL 공식 특성상)
     # dim=-1: 마지막 차원(보통 관계 대상)에 대해 확률 분포를 만듦
     student_log_prob = F.log_softmax(student_logits / temperature, dim=-1)
@@ -714,12 +628,7 @@ class Radar_Distill(BaseBEVBackboneV2):
         return distill_loss, tb_dict
     
     def forward(self, data_dict):
-        """
-        Args:
-            data_dict:
-                spatial_features
-        Returns:
-        """
+        
         spatial_features = data_dict['radar_multi_scale_2d_features']['x_conv4']
         ups = []
         ret_dict = {}
