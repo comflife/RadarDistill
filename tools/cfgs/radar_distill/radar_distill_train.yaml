@@ -104,31 +104,19 @@ MODEL:
         POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
         GRID_SIZE: [1440, 1440, 1]
         
-        TIG_DISTILL:
-            # ===== Keypoint Sampling Configuration =====
-            X_SAMPLE_NUM: 12
-            Y_SAMPLE_NUM: 12
-            OUTER_X_SAMPLE_NUM: 12
-            OUTER_Y_SAMPLE_NUM: 12
-            NUM_KEYPOINTS: 144           # (fallback / logging)
-            NUM_KEYPOINTS_OUTER: 144     # (pre-mask total, will be filtered)
-            
-            # ===== Region Configuration =====
-            INNER_FACTOR: 1.0            # GT box 크기 (inner region = object)
-            OUTER_FACTOR: 1.5            # 확장된 box 크기 (outer region = background)
-            
-            # ===== Loss Weights =====
-            BEV_IC_WEIGHT: 5           # Inter-channel loss weight (inner region correlation)
-            BEV_IK_WEIGHT: 10           # Inter-keypoint loss weight (inner region correlation)
-            BEV_CONTRASTIVE_WEIGHT: 20
-            
-            # ===== Boundary Learning Configuration =====
-            # CONTRASTIVE_MARGIN: Teacher의 box 내부/외부 경계 관계를 Student에게 전달
-            # - Inner Alignment: Student inner → Teacher inner (객체 영역 정렬)
-            # - Outer Alignment: Student outer → Teacher outer (배경 영역 정렬)
-            # - Boundary Consistency: Teacher의 inner-outer 거리를 Student도 학습
-            # - Cross-Boundary: Student inner와 Teacher outer는 멀게 유지 (경계 명확화)
-            CONTRASTIVE_MARGIN: 0.8     # Margin for cross-boundary separation (negative = push away)
+    # TIG_DISTILL:  # Temporarily disabled while focusing on low_loss only
+    #     X_SAMPLE_NUM: 12
+    #     Y_SAMPLE_NUM: 12
+    #     OUTER_X_SAMPLE_NUM: 12
+    #     OUTER_Y_SAMPLE_NUM: 12
+    #     NUM_KEYPOINTS: 144
+    #     NUM_KEYPOINTS_OUTER: 144
+    #     INNER_FACTOR: 1.0
+    #     OUTER_FACTOR: 1.5
+    #     BEV_IC_WEIGHT: 5
+    #     BEV_IK_WEIGHT: 10
+    #     BEV_CONTRASTIVE_WEIGHT: 20
+    #     CONTRASTIVE_MARGIN: 0.8
 
     DENSE_HEAD:
         NAME: CenterHead

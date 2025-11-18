@@ -62,8 +62,9 @@ class PillarNet(Detector3DTemplate):
         loss_rpn, _tb_dict = self.radar_dense_head.get_loss()
         tb_dict.update(_tb_dict)
         
-        # TiGDistill-BEV Inter-channel, Inter-keypoint, and Contrastive
-        if 'loss_bev_combined' in batch_dict:
+        # TiGDistill-BEV Inter-channel, Inter-keypoint, and Contrastive (temporarily disabled)
+        enable_tig_distill = False
+        if enable_tig_distill and 'loss_bev_combined' in batch_dict:
             loss_bev_ic = batch_dict['loss_bev_ic']
             loss_bev_ik = batch_dict['loss_bev_ik']
             loss_bev_combined = batch_dict['loss_bev_combined']

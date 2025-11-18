@@ -84,11 +84,15 @@ def extract_dual_region_keypoints(
     # 추가 옵션 (Config로 관리 권장)
     chunk_size: int = 8192,
     oversample_rate: float = 3.0,
-    deterministic: bool = False 
+    deterministic: bool = False,
+    precomputed_coords=None,
+    return_coords: bool = False
 ):
     batch_size, num_channels, H, W = bev_features.shape
     inner_keypoints_list = []
     outer_keypoints_list = []
+    stored_inner_coords = [] if return_coords else None
+    stored_outer_coords = [] if return_coords else None
 
     device = bev_features.device
     dtype = bev_features.dtype
@@ -105,6 +109,7 @@ def extract_dual_region_keypoints(
         norm_y = (bev_coords_y / (H - 1)) * 2.0 - 1.0
         return torch.stack([norm_x, norm_y], dim=-1)
 
+    coord_cursor = 0
     for b in range(batch_size):
         batch_bev = bev_features[b:b+1]
         batch_boxes = gt_boxes[b]
@@ -115,6 +120,8 @@ def extract_dual_region_keypoints(
 
         if num_valid == 0:
             continue
+
+        use_precomputed = precomputed_coords is not None
 
         centers = valid_boxes[:, 0:2]
         dims = valid_boxes[:, 3:5]
@@ -130,23 +137,95 @@ def extract_dual_region_keypoints(
             torch.stack([sin_a, cos_a], dim=-1)
         ], dim=1)
 
-        # =======================================================
-        # 1. Inner Region (Grid or Random)
-        # =======================================================
-        if x_sample_num is not None and y_sample_num is not None:
-            # Grid Sampling
-            xs = torch.linspace(-0.5, 0.5, steps=x_sample_num, device=device, dtype=dtype)
-            ys = torch.linspace(-0.5, 0.5, steps=y_sample_num, device=device, dtype=dtype)
-            yy, xx = torch.meshgrid(ys, xs, indexing='ij')
-            base_grid = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
-            local_inner = base_grid.unsqueeze(0) * dims_inner.unsqueeze(1)
+        if use_precomputed:
+            try:
+                world_inner = precomputed_coords['inner'][coord_cursor].to(device=device, dtype=dtype)
+                final_world_outer = precomputed_coords['outer'][coord_cursor].to(device=device, dtype=dtype)
+            except (IndexError, KeyError, TypeError):
+                raise ValueError('Invalid precomputed_coords passed to extract_dual_region_keypoints')
         else:
-            # Random Sampling
-            rand_pts = torch.rand(num_valid, num_keypoints_inner, 2, device=device, dtype=dtype) - 0.5
-            local_inner = rand_pts * dims_inner.unsqueeze(1)
+            # =======================================================
+            # 1. Inner Region (Grid or Random)
+            # =======================================================
+            if x_sample_num is not None and y_sample_num is not None:
+                xs = torch.linspace(-0.5, 0.5, steps=x_sample_num, device=device, dtype=dtype)
+                ys = torch.linspace(-0.5, 0.5, steps=y_sample_num, device=device, dtype=dtype)
+                yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+                base_grid = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
+                local_inner = base_grid.unsqueeze(0) * dims_inner.unsqueeze(1)
+            else:
+                rand_pts = torch.rand(num_valid, num_keypoints_inner, 2, device=device, dtype=dtype) - 0.5
+                local_inner = rand_pts * dims_inner.unsqueeze(1)
 
-        pts_rotated_inner = torch.matmul(local_inner, rot_mat.transpose(1, 2))
-        world_inner = centers.unsqueeze(1) + pts_rotated_inner
+            pts_rotated_inner = torch.matmul(local_inner, rot_mat.transpose(1, 2))
+            world_inner = centers.unsqueeze(1) + pts_rotated_inner
+
+            # =======================================================
+            # 2. Outer Region (Grid or Random) - Optimized
+            # =======================================================
+            if outer_x_sample_num is not None and outer_y_sample_num is not None:
+                xs_o = torch.linspace(-0.5, 0.5, steps=outer_x_sample_num, device=device, dtype=dtype)
+                ys_o = torch.linspace(-0.5, 0.5, steps=outer_y_sample_num, device=device, dtype=dtype)
+                yy_o, xx_o = torch.meshgrid(ys_o, xs_o, indexing='ij')
+                base_grid_o = torch.stack([xx_o.reshape(-1), yy_o.reshape(-1)], dim=-1)
+                local_outer_cand = base_grid_o.unsqueeze(0) * dims_outer.unsqueeze(1)
+                num_cand = local_outer_cand.shape[1]
+                use_random_score = False
+            else:
+                num_cand = int(target_outer * oversample_rate)
+                rand_pts_o = torch.rand(num_valid, num_cand, 2, device=device, dtype=dtype) - 0.5
+                local_outer_cand = rand_pts_o * dims_outer.unsqueeze(1)
+                use_random_score = not deterministic
+
+            half_inner = dims_inner / 2.0
+            inside_self = (torch.abs(local_outer_cand[..., 0]) <= half_inner[:, 0:1]) & \
+                          (torch.abs(local_outer_cand[..., 1]) <= half_inner[:, 1:2])
+
+            pts_rotated_outer = torch.matmul(local_outer_cand, rot_mat.transpose(1, 2))
+            world_outer_cand = centers.unsqueeze(1) + pts_rotated_outer
+
+            flat_candidates = world_outer_cand.view(-1, 2)
+            is_collision_flat = torch.zeros(flat_candidates.shape[0], dtype=torch.bool, device=device)
+            half_dims_inner_all = dims_inner / 2.0
+
+            for i in range(0, flat_candidates.shape[0], chunk_size):
+                chunk_pts = flat_candidates[i : i + chunk_size]
+                rel_pos = chunk_pts.unsqueeze(0) - centers.unsqueeze(1)
+                local_pos = torch.einsum('ncj, nkj -> nck', rel_pos, rot_mat)
+                in_box = (torch.abs(local_pos[..., 0]) <= half_dims_inner_all[:, 0:1]) & \
+                         (torch.abs(local_pos[..., 1]) <= half_dims_inner_all[:, 1:2])
+                is_collision_flat[i : i + chunk_size] = in_box.any(dim=0)
+
+            is_collision = is_collision_flat.view(num_valid, num_cand)
+            invalid_mask = inside_self | is_collision
+
+            valid_score = (~invalid_mask).float()
+            if use_random_score:
+                valid_score += torch.rand_like(valid_score) * 0.1
+
+            _, sorted_indices = torch.topk(valid_score, k=num_cand, dim=1)
+            num_valid_per_box = (~invalid_mask).sum(dim=1)
+            idx_grid = torch.arange(target_outer, device=device).unsqueeze(0).expand(num_valid, -1)
+            safe_num_valid = num_valid_per_box.clamp(min=1).unsqueeze(1)
+            refined_indices_pos = idx_grid % safe_num_valid
+            final_indices = torch.gather(sorted_indices, 1, refined_indices_pos)
+
+            final_world_outer = torch.gather(
+                world_outer_cand, 1,
+                final_indices.unsqueeze(-1).expand(-1, -1, 2)
+            )
+
+            zero_valid_mask = (num_valid_per_box == 0)
+            if zero_valid_mask.any():
+                corner_signs = torch.tensor([[1, 1], [1, -1], [-1, 1], [-1, -1]], device=device, dtype=dtype) * 0.5
+                corners_local = corner_signs.unsqueeze(0).repeat(1, (target_outer + 3) // 4, 1)[:, :target_outer, :]
+                bad_indices = torch.nonzero(zero_valid_mask).squeeze(1)
+
+                c_local = corners_local.repeat(bad_indices.shape[0], 1, 1) * dims_outer[bad_indices].unsqueeze(1)
+                c_rot = rot_mat[bad_indices]
+                c_center = centers[bad_indices]
+                c_world = c_center.unsqueeze(1) + torch.matmul(c_local, c_rot.transpose(1, 2))
+                final_world_outer[bad_indices] = c_world
         
         features_inner = F.grid_sample(
             batch_bev, get_normalized_grid(world_inner).unsqueeze(0), 
@@ -154,110 +233,6 @@ def extract_dual_region_keypoints(
         ).squeeze(0).permute(1, 2, 0)
         inner_keypoints_list.append(features_inner)
 
-        # =======================================================
-        # 2. Outer Region (Grid or Random) - Optimized
-        # =======================================================
-        
-        # A. 후보 점(Candidate) 생성
-        if outer_x_sample_num is not None and outer_y_sample_num is not None:
-            # [Grid Mode] 일정한 간격
-            xs_o = torch.linspace(-0.5, 0.5, steps=outer_x_sample_num, device=device, dtype=dtype)
-            ys_o = torch.linspace(-0.5, 0.5, steps=outer_y_sample_num, device=device, dtype=dtype)
-            yy_o, xx_o = torch.meshgrid(ys_o, xs_o, indexing='ij')
-            base_grid_o = torch.stack([xx_o.reshape(-1), yy_o.reshape(-1)], dim=-1) # (K_grid, 2)
-            
-            # 모든 박스에 대해 Grid 복제
-            local_outer_cand = base_grid_o.unsqueeze(0) * dims_outer.unsqueeze(1) # (N, K_grid, 2)
-            num_cand = local_outer_cand.shape[1]
-            use_random_score = False # Grid 모드면 굳이 섞을 필요 없음 (옵션)
-        else:
-            # [Random Mode]
-            num_cand = int(target_outer * oversample_rate)
-            rand_pts_o = torch.rand(num_valid, num_cand, 2, device=device, dtype=dtype) - 0.5
-            local_outer_cand = rand_pts_o * dims_outer.unsqueeze(1)
-            use_random_score = not deterministic
-
-        # B. 마스킹 1: 자기 자신의 Inner 영역 제외 (Donut Shape)
-        half_inner = dims_inner / 2.0
-        inside_self = (torch.abs(local_outer_cand[..., 0]) <= half_inner[:, 0:1]) & \
-                      (torch.abs(local_outer_cand[..., 1]) <= half_inner[:, 1:2])
-
-        # C. 좌표 변환 (Local -> World)
-        pts_rotated_outer = torch.matmul(local_outer_cand, rot_mat.transpose(1, 2))
-        world_outer_cand = centers.unsqueeze(1) + pts_rotated_outer
-        
-        # D. 마스킹 2: 다른 박스 침범 여부 (Global Check)
-        flat_candidates = world_outer_cand.view(-1, 2)
-        is_collision_flat = torch.zeros(flat_candidates.shape[0], dtype=torch.bool, device=device)
-        half_dims_inner_all = dims_inner / 2.0
-
-        # 메모리 절약을 위한 Chunk 처리
-        for i in range(0, flat_candidates.shape[0], chunk_size):
-            chunk_pts = flat_candidates[i : i + chunk_size]
-            # (N, chunk, 2) - 모든 박스와 비교
-            rel_pos = chunk_pts.unsqueeze(0) - centers.unsqueeze(1)
-            local_pos = torch.einsum('ncj, nkj -> nck', rel_pos, rot_mat)
-            
-            # 박스 내부인지 확인
-            in_box = (torch.abs(local_pos[..., 0]) <= half_dims_inner_all[:, 0:1]) & \
-                     (torch.abs(local_pos[..., 1]) <= half_dims_inner_all[:, 1:2])
-            
-            # 어떤 박스라도 침범했으면 Collision
-            is_collision_flat[i : i + chunk_size] = in_box.any(dim=0)
-
-        is_collision = is_collision_flat.view(num_valid, num_cand)
-        
-        # 최종 Invalid Mask (True = 쓸 수 없는 점)
-        invalid_mask = inside_self | is_collision
-
-        # E. 점 선택 (Selection)
-        # 유효한 점(False)을 우선순위로 둠
-        valid_score = (~invalid_mask).float()
-        
-        if use_random_score:
-            # Random 모드면 점수가 같을 때 랜덤하게 섞임
-            valid_score += torch.rand_like(valid_score) * 0.1
-        else:
-            # Grid 모드면 원래 순서(좌상단 -> 우하단 등)를 유지하거나
-            # 중심에서 먼 순서 등 규칙을 줄 수 있음. 여기선 원래 순서 유지.
-            # topk는 stable하지 않을 수 있으므로, index를 아주 작게 더해서 순서 보존
-            # (여기서는 간단히 처리)
-            pass
-
-        # 점수가 높은(유효한) 순서대로 정렬
-        _, sorted_indices = torch.topk(valid_score, k=num_cand, dim=1)
-        
-        # Fallback Logic: 유효한 점이 부족하면, 유효한 점들을 반복해서 채움
-        num_valid_per_box = (~invalid_mask).sum(dim=1)
-        
-        idx_grid = torch.arange(target_outer, device=device).unsqueeze(0).expand(num_valid, -1)
-        safe_num_valid = num_valid_per_box.clamp(min=1).unsqueeze(1)
-        
-        # Modulo 연산으로 유효 인덱스 순환 (Grid 모드에서도 유효한 점들만 앞에서부터 반복됨)
-        refined_indices_pos = idx_grid % safe_num_valid
-        
-        # sorted_indices의 앞부분(Valid)만 가져오기
-        final_indices = torch.gather(sorted_indices, 1, refined_indices_pos)
-        
-        final_world_outer = torch.gather(
-            world_outer_cand, 1, 
-            final_indices.unsqueeze(-1).expand(-1, -1, 2)
-        )
-
-        # Corner Fallback (완전히 망한 박스 구제용)
-        zero_valid_mask = (num_valid_per_box == 0)
-        if zero_valid_mask.any():
-             corner_signs = torch.tensor([[1, 1], [1, -1], [-1, 1], [-1, -1]], device=device, dtype=dtype) * 0.5
-             corners_local = corner_signs.unsqueeze(0).repeat(1, (target_outer + 3) // 4, 1)[:, :target_outer, :]
-             bad_indices = torch.nonzero(zero_valid_mask).squeeze(1)
-             
-             c_local = corners_local.repeat(bad_indices.shape[0], 1, 1) * dims_outer[bad_indices].unsqueeze(1)
-             c_rot = rot_mat[bad_indices]
-             c_center = centers[bad_indices]
-             c_world = c_center.unsqueeze(1) + torch.matmul(c_local, c_rot.transpose(1, 2))
-             final_world_outer[bad_indices] = c_world
-
-        # F. Feature Sampling
         features_outer = F.grid_sample(
             batch_bev, get_normalized_grid(final_world_outer).unsqueeze(0), 
             mode='bilinear', align_corners=True
@@ -265,9 +240,19 @@ def extract_dual_region_keypoints(
 
         outer_keypoints_list.append(features_outer)
 
+        if return_coords:
+            stored_inner_coords.append(world_inner)
+            stored_outer_coords.append(final_world_outer)
+
+        coord_cursor += 1
+
     if len(inner_keypoints_list) > 0:
+        if return_coords:
+            return inner_keypoints_list, outer_keypoints_list, {'inner': stored_inner_coords, 'outer': stored_outer_coords}
         return inner_keypoints_list, outer_keypoints_list
     else:
+        if return_coords:
+            return [], [], {'inner': [], 'outer': []}
         return [], []
     
 
@@ -525,12 +510,13 @@ class Radar_Distill(BaseBEVBackboneV2):
         low_distill_loss = 0.5 * (feature_loss + de_8x_feature_loss) + 0.5 * (mask_loss + de_8x_mask_loss)
         low_distill_loss *= 5
         distill_loss = low_distill_loss + high_distill_loss
-        
+
         # ================== TiGDistill-BEV Inter-channel Distillation Loss with Dual Region ==================
-        # Extract TiGDistill configuration
-        distill_cfg = self.model_cfg.get('TIG_DISTILL', {})
+        # Temporarily disabled while focusing on low-level losses only.
+        enable_tig_distill = False
+        distill_cfg = self.model_cfg.get('TIG_DISTILL', {}) if enable_tig_distill else {}
         tig_distill_dict = {}
-        if distill_cfg:
+        if enable_tig_distill and distill_cfg:
             num_keypoints_inner = distill_cfg.get('NUM_KEYPOINTS', 256)
             num_keypoints_outer = distill_cfg.get('NUM_KEYPOINTS_OUTER', 256)
             inner_factor = distill_cfg.get('INNER_FACTOR', 1.0)
@@ -551,22 +537,28 @@ class Radar_Distill(BaseBEVBackboneV2):
             student_bev_features = high_radar_bev
             
             # Extract dual region keypoint features from both teacher and student
-            teacher_inner_list, teacher_outer_list = extract_dual_region_keypoints(
+            teacher_inner_list, teacher_outer_list, keypoint_coords = extract_dual_region_keypoints(
                 teacher_bev_features, gt_boxes, 
                 self.point_cloud_range, self.voxel_size, 
                 num_keypoints_inner, num_keypoints_outer,
                 inner_factor, outer_factor,
                 x_sample_num, y_sample_num,
-                outer_x_sample_num, outer_y_sample_num
+                outer_x_sample_num, outer_y_sample_num,
+                return_coords=True
             )
-            student_inner_list, student_outer_list = extract_dual_region_keypoints(
-                student_bev_features, gt_boxes, 
-                self.point_cloud_range, self.voxel_size, 
-                num_keypoints_inner, num_keypoints_outer,
-                inner_factor, outer_factor,
-                x_sample_num, y_sample_num,
-                outer_x_sample_num, outer_y_sample_num
-            )
+
+            if len(keypoint_coords['inner']) > 0:
+                student_inner_list, student_outer_list = extract_dual_region_keypoints(
+                    student_bev_features, gt_boxes, 
+                    self.point_cloud_range, self.voxel_size, 
+                    num_keypoints_inner, num_keypoints_outer,
+                    inner_factor, outer_factor,
+                    x_sample_num, y_sample_num,
+                    outer_x_sample_num, outer_y_sample_num,
+                    precomputed_coords=keypoint_coords
+                )
+            else:
+                student_inner_list, student_outer_list = [], []
 
             # Compute inter-channel and inter-keypoint correlation loss
             loss_bev_ic = 0.0  # inter-channel loss (inner region only)
@@ -591,17 +583,14 @@ class Radar_Distill(BaseBEVBackboneV2):
                         # ============= Inner Region: Alignment Loss =============
                         f_teacher_inner = teacher_inner[obj_idx]  # (num_keypoints_inner, C)
                         f_student_inner = student_inner[obj_idx]  # (num_keypoints_inner, C)
-                        f_teacher_inner_norm = F.normalize(f_teacher_inner, p=2, dim=1)
-                        f_student_inner_norm = F.normalize(f_student_inner, p=2, dim=1)
-
                         # Compute inter-channel correlation matrices
-                        A_teacher = f_teacher_inner_norm.T @ f_teacher_inner_norm  # (C, C)
-                        A_student = f_student_inner_norm.T @ f_student_inner_norm  # (C, C)
+                        A_teacher = f_teacher_inner.T @ f_teacher_inner  # (C, C)
+                        A_student = f_student_inner.T @ f_student_inner  # (C, C)
                         loss_bev_ic += F.mse_loss(A_teacher, A_student, reduction='mean')
                         
                         # Compute inter-keypoint correlation matrices
-                        B_teacher = f_teacher_inner_norm @ f_teacher_inner_norm.T  # (num_keypoints_inner, num_keypoints_inner)
-                        B_student = f_student_inner_norm @ f_student_inner_norm.T  # (num_keypoints_inner, num_keypoints_inner)
+                        B_teacher = f_teacher_inner @ f_teacher_inner.T  # (num_keypoints_inner, num_keypoints_inner)
+                        B_student = f_student_inner @ f_student_inner.T  # (num_keypoints_inner, num_keypoints_inner)
                         loss_bev_ik += F.mse_loss(B_teacher, B_student, reduction='mean')
                         
                         # ============= Outer Region: Teacher-Student Boundary Learning =============
@@ -620,16 +609,10 @@ class Radar_Distill(BaseBEVBackboneV2):
                         f_teacher_outer = teacher_outer[obj_idx]  # (num_keypoints_outer, C)
                         f_student_outer = student_outer[obj_idx]  # (num_keypoints_outer, C)
                         
-                        # L2 normalize all features for stable and consistent distance computation
-                        # 모든 feature를 normalize하여 방향성(orientation)에 집중하고 스케일 영향 제거
-                        t_inner_norm = F.normalize(f_teacher_inner, p=2, dim=1)  # (num_keypoints_inner, C)
-                        t_outer_norm = F.normalize(f_teacher_outer, p=2, dim=1)  # (num_keypoints_outer, C)
-                        s_inner_norm = F.normalize(f_student_inner, p=2, dim=1)  # (num_keypoints_inner, C)
-                        s_outer_norm = F.normalize(f_student_outer, p=2, dim=1)  # (num_keypoints_outer, C)
-                        
-                        # inner_alignment = F.mse_loss(s_inner_norm, t_inner_norm, reduction='mean')
-                        
-                        # outer_alignment = F.mse_loss(s_outer_norm, t_outer_norm, reduction='mean')
+                        t_inner_norm = f_teacher_inner
+                        t_outer_norm = f_teacher_outer
+                        s_inner_norm = f_student_inner
+                        s_outer_norm = f_student_outer
                         
                         # 3. Boundary Consistency: Teacher의 inner-outer 경계 거리를 Student도 학습
                         # KL Divergence를 사용하여 관계 분포를 정렬
