@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # GPU 모니터링 및 자동 학습 시작 스크립트
-# GPU 2,3번이 VRAM 30% 이하로 내려가고 1분간 증가 추세가 없으면 학습 시작
+# GPU 2,3번이 VRAM 10% 이하로 내려가고 1분간 증가 추세가 없으면 학습 시작
 
 # 색상 코드
 RED='\033[0;31m'
@@ -10,7 +10,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}=== GPU 모니터링 및 자동 학습 스크립트 시작 ===${NC}"
-echo "GPU 2,3번의 VRAM이 30% 이하로 내려가는지 모니터링합니다..."
+echo "GPU 2,3번의 VRAM이 10% 이하로 내려가는지 모니터링합니다..."
 echo "조건 충족 시 자동으로 학습을 시작합니다."
 echo ""
 
@@ -43,10 +43,10 @@ check_both_gpus_free() {
     echo -e "GPU 2: ${gpu2_usage}% | GPU 3: ${gpu3_usage}%"
     
     # bc를 사용하여 부동소수점 비교
-    if (( $(echo "$gpu2_usage < 30.0" | bc -l) )) && (( $(echo "$gpu3_usage < 30.0" | bc -l) )); then
-        return 0  # 둘 다 30% 미만
+    if (( $(echo "$gpu2_usage < 10.0" | bc -l) )) && (( $(echo "$gpu3_usage < 10.0" | bc -l) )); then
+        return 0  # 둘 다 10% 미만
     else
-        return 1  # 하나라도 30% 이상
+        return 1  # 하나라도 10% 이상
     fi
 }
 
@@ -58,7 +58,7 @@ while true; do
     current_time=$(date '+%Y-%m-%d %H:%M:%S')
     
     if check_both_gpus_free; then
-        echo -e "${GREEN}[$current_time] GPU 2,3번 모두 30% 이하 감지!${NC}"
+        echo -e "${GREEN}[$current_time] GPU 2,3번 모두 10% 이하 감지!${NC}"
         echo -e "${YELLOW}1분간 VRAM 증가 추세를 확인합니다...${NC}"
         
         # 초기 VRAM 값 저장
@@ -74,9 +74,9 @@ while true; do
             
             echo "  체크 $i/12: GPU 2: ${current_gpu2}% | GPU 3: ${current_gpu3}%"
             
-            # 30% 초과하거나 초기값보다 5% 이상 증가하면 안정적이지 않음
-            if (( $(echo "$current_gpu2 > 30.0" | bc -l) )) || (( $(echo "$current_gpu3 > 30.0" | bc -l) )); then
-                echo -e "${RED}  GPU 사용률이 30%를 초과했습니다. 모니터링을 재시작합니다.${NC}"
+            # 10% 초과하거나 초기값보다 5% 이상 증가하면 안정적이지 않음
+            if (( $(echo "$current_gpu2 > 10.0" | bc -l) )) || (( $(echo "$current_gpu3 > 10.0" | bc -l) )); then
+                echo -e "${RED}  GPU 사용률이 10%를 초과했습니다. 모니터링을 재시작합니다.${NC}"
                 stable=false
                 break
             fi
