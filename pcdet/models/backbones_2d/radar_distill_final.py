@@ -285,6 +285,13 @@ class Radar_Distill(BaseBEVBackboneV2):
         super().__init__(model_cfg, **kwargs)
         self.model_cfg = model_cfg
         
+        # Class-adaptive feature selection strategy
+        # nuScenes class indices: ['car', 'truck', 'bus', 'trailer', 'construction_vehicle', 
+        #                          'pedestrian', 'motorcycle', 'bicycle', 'traffic_cone', 'barrier']
+        self.HIGH_LEVEL_CLASSES = [1, 2, 3]  # truck, bus, trailer - benefit from high-level semantic features
+        self.LOW_LEVEL_ONLY_CLASSES = [8, 9]  # traffic_cone, barrier - low-level spatial details only
+        self.BALANCED_CLASSES = [0, 4, 5, 6, 7]  # car, construction_vehicle, pedestrian, motorcycle, bicycle
+        
         self.encoder_1 = nn.Sequential(
             ConvNeXtBlock(dim=256,downsample=True),
             ConvNeXtBlock(dim=256,downsample=False),
@@ -473,6 +480,99 @@ class Radar_Distill(BaseBEVBackboneV2):
 
         return density_maps
     
+    @torch.no_grad()
+    def _get_class_weight_mask(self, batch_dict, H, W, device, dtype):
+        """
+        Generate class-adaptive weight mask for high-level features.
+        
+        Different object classes benefit from different feature levels:
+        - Large moving vehicles (truck, bus, trailer) → high-level semantic features
+        - Static objects (barrier, traffic_cone) → low-level spatial details only
+        - Balanced classes → moderate high-level contribution
+        
+        Args:
+            batch_dict: dictionary containing gt_boxes
+            H, W: height and width of BEV feature map
+            device, dtype: torch device and data type
+            
+        Returns:
+            weight_mask: (B, 1, H, W) - per-pixel weight for high-level loss
+                         1.0 for high-level classes (truck, bus, trailer)
+                         0.0 for low-level only classes (barrier, traffic_cone)
+                         0.5 for balanced classes (car, pedestrian, etc.)
+        """
+        B = batch_dict['batch_size']
+        weight_mask = torch.ones((B, 1, H, W), device=device, dtype=dtype)
+        
+        gt_boxes = batch_dict['gt_boxes']
+        if not torch.is_tensor(gt_boxes):
+            gt_boxes = torch.from_numpy(gt_boxes).to(device=device, dtype=dtype)
+        else:
+            gt_boxes = gt_boxes.to(device=device, dtype=dtype)
+        
+        pixel_size = float(self.voxel_size[0])
+        pc_range = self.point_cloud_range
+        x_min, y_min = pc_range[0], pc_range[1]
+        x_max, y_max = pc_range[3], pc_range[4]
+        x_range = x_max - x_min
+        y_range = y_max - y_min
+        
+        for b in range(B):
+            valid_mask = gt_boxes[b].sum(dim=1) != 0
+            boxes = gt_boxes[b][valid_mask]
+            
+            if boxes.shape[0] == 0:
+                continue
+            
+            for box in boxes:
+                class_id = int(box[7])  # Last element is class ID
+                
+                # Determine weight based on class category
+                if class_id in self.LOW_LEVEL_ONLY_CLASSES:
+                    weight = 0.0  # No high-level features for barrier, traffic_cone
+                elif class_id in self.HIGH_LEVEL_CLASSES:
+                    weight = 1.0  # Full high-level features for truck, bus, trailer
+                elif class_id in self.BALANCED_CLASSES:
+                    weight = 0.5  # Moderate high-level features for car, pedestrian, etc.
+                else:
+                    weight = 0.5  # Default: balanced
+                
+                # Create box mask in BEV grid
+                center = box[0:2]
+                size = box[3:5]
+                angle = box[6]
+                
+                # Create a local grid around the box (similar to radar distribution projection)
+                # Use box size * 1.2 to cover the object region
+                coverage = max(size).item() * 1.2
+                grid_size = int(coverage / pixel_size)
+                grid_size = max(16, min(grid_size, 128))
+                if grid_size % 2 == 0:
+                    grid_size += 1
+                
+                # Generate local coordinates
+                half_grid_world = (grid_size * pixel_size) / 2.0
+                local_x = torch.linspace(-half_grid_world, half_grid_world, grid_size, device=device, dtype=dtype)
+                local_y = torch.linspace(-half_grid_world, half_grid_world, grid_size, device=device, dtype=dtype)
+                yy, xx = torch.meshgrid(local_y, local_x, indexing='ij')
+                local_coords = torch.stack([xx, yy], dim=-1)
+                
+                # Rotate to world frame
+                cos_a, sin_a = torch.cos(angle), torch.sin(angle)
+                rot_mat = torch.tensor([[cos_a, -sin_a], [sin_a, cos_a]], device=device, dtype=dtype)
+                
+                local_flat = local_coords.reshape(-1, 2)
+                world_flat = torch.matmul(local_flat, rot_mat.T) + center.unsqueeze(0)
+                
+                # World → Global BEV grid index
+                bev_x_idx = ((world_flat[:, 0] - x_min) / x_range * W).long().clamp(0, W - 1)
+                bev_y_idx = ((world_flat[:, 1] - y_min) / y_range * H).long().clamp(0, H - 1)
+                
+                # Apply class-specific weight to this box region (VECTORIZED - no for loop!)
+                weight_mask[b, 0, bev_y_idx, bev_x_idx] = weight
+        
+        return weight_mask
+    
     
     def low_loss(self, lidar_bev, radar_bev, batch_dict):
 
@@ -577,70 +677,6 @@ class Radar_Distill(BaseBEVBackboneV2):
         device = radar_bev.device
         dtype = radar_bev.dtype
         
-        # === Object-aligned Radar Distribution 생성 (low_loss와 동일) ===
-        density_maps = self._build_gt_radar_distribution_object_aligned(
-            batch_dict, device, dtype
-        )
-
-        # === Object-aligned grids → Global BEV grid로 projection ===
-        radar_distribution = torch.zeros((B, 1, H, W), device=device, dtype=dtype)
-        gt_boxes = batch_dict['gt_boxes']
-        
-        pixel_size = float(self.voxel_size[0])
-        pc_range = self.point_cloud_range
-        x_min, y_min = pc_range[0], pc_range[1]
-        x_max, y_max = pc_range[3], pc_range[4]
-        x_range = x_max - x_min
-        y_range = y_max - y_min
-
-        for b in range(B):
-            if b >= len(density_maps) or len(density_maps[b]) == 0:
-                continue
-            
-            valid_mask = gt_boxes[b].sum(dim=1) != 0
-            boxes = gt_boxes[b][valid_mask]
-            
-            for i, obj_grid in enumerate(density_maps[b]):
-                if obj_grid is None or i >= boxes.shape[0]:
-                    continue
-                
-                box = boxes[i]
-                center = box[0:2]
-                angle = box[6]
-                
-                grid_size = obj_grid.shape[0]
-                
-                # Local grid 좌표 생성 (object center 기준)
-                half_grid_world = (grid_size * pixel_size) / 2.0
-                local_x = torch.linspace(-half_grid_world, half_grid_world, grid_size, device=device, dtype=dtype)
-                local_y = torch.linspace(-half_grid_world, half_grid_world, grid_size, device=device, dtype=dtype)
-                yy, xx = torch.meshgrid(local_y, local_x, indexing='ij')
-                local_coords = torch.stack([xx, yy], dim=-1)  # (grid_size, grid_size, 2)
-                
-                # Rotate to world frame
-                cos_a, sin_a = torch.cos(angle), torch.sin(angle)
-                rot_mat = torch.tensor([[cos_a, -sin_a], [sin_a, cos_a]], device=device, dtype=dtype)
-                
-                local_flat = local_coords.reshape(-1, 2)  # (grid_size^2, 2)
-                world_flat = torch.matmul(local_flat, rot_mat.T) + center.unsqueeze(0)  # (grid_size^2, 2)
-                
-                # World → Global BEV grid index
-                bev_x_idx = ((world_flat[:, 0] - x_min) / x_range * W).long().clamp(0, W - 1)
-                bev_y_idx = ((world_flat[:, 1] - y_min) / y_range * H).long().clamp(0, H - 1)
-                
-                # Object-aligned density 값을 global BEV에 누적
-                density_values = obj_grid.reshape(-1)  # (grid_size^2,)
-                
-                # scatter_add로 누적 (여러 객체가 겹치는 경우 합산)
-                flat_indices = bev_y_idx * W + bev_x_idx
-                radar_distribution[b, 0].view(-1).scatter_add_(0, flat_indices, density_values)
-        
-        # 최종 정규화 (per-batch)
-        for b in range(B):
-            max_val = radar_distribution[b].max()
-            if max_val > 0:
-                radar_distribution[b] = radar_distribution[b] / max_val
-
         # === 기존 heatmap 기반 mask 계산 ===
         thres = 0.1
         gt_thres = 0.1
@@ -655,10 +691,6 @@ class Radar_Distill(BaseBEVBackboneV2):
         radar_fn_mask = torch.logical_and(gt_batch_hm_max > gt_thres, radar_batch_hm_max < thres)
         radar_tp_mask = torch.logical_and(gt_batch_hm_max > gt_thres, radar_batch_hm_max > thres)
         
-        # === Radar Distribution을 활용한 weight 조정 ===
-        # GT box 영역 내에서는 radar distribution 값에 따라 가중치를 조정
-        gt_box_mask = (radar_distribution > 0).float()
-        
         # 기본 weight 계산
         wegiht = torch.zeros_like(radar_batch_hm_max)
         tp_fn_sum = (radar_tp_mask + radar_fn_mask).sum()
@@ -669,10 +701,6 @@ class Radar_Distill(BaseBEVBackboneV2):
         if fp_sum > 0:
             wegiht[radar_fp_mask] = 1.0 / fp_sum
         
-        # Radar distribution으로 weight 조정: 객체 중심부로 갈수록 가중치 증가
-        # GT box 영역 내에서만 적용
-        adjusted_weight = wegiht * (1.0 + gt_box_mask * radar_distribution * 2.0)
-        
         # === Loss 계산 ===
         scaled_radar_bev = radar_bev.softmax(1)
         scaled_lidar_bev = lidar_bev.softmax(1)
@@ -680,9 +708,9 @@ class Radar_Distill(BaseBEVBackboneV2):
         scaled_radar_bev2 = radar_bev2.softmax(1)
         scaled_lidar_bev2 = lidar_bev2.softmax(1)
         
-        high_loss = F.l1_loss(scaled_radar_bev, scaled_lidar_bev, reduction='none') * adjusted_weight
+        high_loss = F.l1_loss(scaled_radar_bev, scaled_lidar_bev, reduction='none') * wegiht
         high_loss = high_loss.sum()
-        high_8x_loss = F.l1_loss(scaled_radar_bev2, scaled_lidar_bev2, reduction='none') * adjusted_weight
+        high_8x_loss = F.l1_loss(scaled_radar_bev2, scaled_lidar_bev2, reduction='none') * wegiht
         high_8x_loss = high_8x_loss.sum()
         high_loss = 0.5 * (high_loss + high_8x_loss)
         return high_loss
