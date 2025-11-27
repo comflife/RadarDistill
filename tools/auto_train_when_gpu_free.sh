@@ -93,21 +93,21 @@ while true; do
             echo ""
             
             # output 폴더 이름 변경
-            if [ -d "/home/byounggun/RadarDistill/output" ]; then
-                echo -e "${YELLOW}기존 output 폴더를 output2로 변경합니다...${NC}"
-                mv /home/byounggun/RadarDistill/output /home/byounggun/RadarDistill/output2
-                echo -e "${GREEN}폴더 이름 변경 완료!${NC}"
-            else
-                echo -e "${YELLOW}output 폴더가 존재하지 않습니다. 건너뜁니다.${NC}"
-            fi
+            # if [ -d "/home/byounggun/RadarDistill/output" ]; then
+            #     echo -e "${YELLOW}기존 output 폴더를 output2로 변경합니다...${NC}"
+            #     mv /home/byounggun/RadarDistill/output /home/byounggun/RadarDistill/output2
+            #     echo -e "${GREEN}폴더 이름 변경 완료!${NC}"
+            # else
+            #     echo -e "${YELLOW}output 폴더가 존재하지 않습니다. 건너뜁니다.${NC}"
+            # fi
             
             echo ""
             echo -e "${GREEN}학습 시작...${NC}"
-            echo "명령어: CUDA_VISIBLE_DEVICES=2,3 bash scripts/dist_train.sh 2 --cfg_file cfgs/radar_distill/radar_distill_train.yaml --pretrained_model ../ckpt/pillarnet_fullset_init.pth"
+            echo "명령어: CUDA_VISIBLE_DEVICES=2,3 bash scripts/dist_train.sh 2 --cfg_file cfgs/radar_distill/radar_distill_train.yaml --pretrained_model ../ckpt/pillarnet_fullset_init.pth --fix_random_seed --extra_tag ddmup"
             echo ""
             
             # 학습 실행
-            CUDA_VISIBLE_DEVICES=2,3 bash scripts/dist_train.sh 2 --cfg_file cfgs/radar_distill/radar_distill_train.yaml --pretrained_model ../ckpt/pillarnet_fullset_init.pth
+            CUDA_VISIBLE_DEVICES=2,3 bash scripts/dist_train.sh 2 --cfg_file cfgs/radar_distill/radar_distill_train.yaml --pretrained_model ../ckpt/pillarnet_fullset_init.pth --fix_random_seed --extra_tag ddmup
             
             echo -e "${GREEN}=== 스크립트 종료 ===${NC}"
             exit 0

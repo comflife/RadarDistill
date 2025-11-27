@@ -56,6 +56,7 @@ def parse_config():
     parser.add_argument('--ckpt_save_time_interval', type=int, default=300, help='in terms of seconds')
     parser.add_argument('--wo_gpu_stat', action='store_true', help='')
     parser.add_argument('--use_amp', action='store_true', help='use mix precision training')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='WandB entity to use')
     
 
     args = parser.parse_args()
@@ -130,7 +131,7 @@ def main():
                     project="radardistill",
                     name=name,
                     dir=str(output_dir),
-                    entity="4DR_siu",  # Change this to your wandb entity/username
+                    entity=args.wandb_entity,
                     config=vars(cfg)
                 )
                 wandb.config.update(vars(args), allow_val_change=True)
